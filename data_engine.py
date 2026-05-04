@@ -1,129 +1,296 @@
 import duckdb
+from datetime import datetime
 from aws_client import setup_duckdb_s3
-from constants import TABLES
+from constants import TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES
 
 
 class DataEngine:
     def __init__(self):
-        # Create an in-memory DuckDB connection
         self.con = duckdb.connect(database=':memory:')
         setup_duckdb_s3(self.con)
         self._initialize_views()
+        self.filter_options = self._load_filter_options()
+
+    # ------------------------------------------------------------------
+    # Init helpers
+    # ------------------------------------------------------------------
 
     def _initialize_views(self):
-        """Create lazy views for S3 Parquet files. No data is downloaded yet."""
+        """Create lazy views for S3 Parquet files. No data is transferred yet."""
         for name, path in TABLES.items():
             self.con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
 
-    def get_overview_stats(self, phases):
-        """
-        Aggregates data across base, location, and phases.
-        DuckDB pushes the 'WHERE' filter down to S3 to minimize data transfer.
-        """
-        # Handling SQL IN clause for 1 or more elements
-        phase_filter = f"IN {tuple(phases)}" if len(phases) > 1 else f"= '{phases[0]}'"
+    def _load_filter_options(self):
+        """Load unique values for each filter dropdown once at startup."""
+        def _fetch(sql):
+            try:
+                return [r[0] for r in self.con.execute(sql).fetchall()]
+            except Exception as e:
+                print(f"Filter options load error: {e}")
+                return []
 
-        query = f"""
-            SELECT 
-                l.protocolsection_contactslocationsmodule_locations_country as country,
-                COUNT(DISTINCT b.protocolsection_identificationmodule_nctid) as trial_count
-            FROM base b
-            JOIN phases p ON b.protocolsection_identificationmodule_nctid = p.protocolsection_identificationmodule_nctid
-            JOIN locations l ON b.protocolsection_identificationmodule_nctid = l.protocolsection_identificationmodule_nctid
-            GROUP BY 1
-            ORDER BY 2 DESC
-            LIMIT 15
+        return {
+            "phases": _fetch(
+                "SELECT DISTINCT protocolsection_designmodule_phases "
+                "FROM phases WHERE protocolsection_designmodule_phases IS NOT NULL ORDER BY 1"
+            ),
+            "statuses": _fetch(
+                "SELECT DISTINCT protocolsection_statusmodule_overallstatus "
+                "FROM base WHERE protocolsection_statusmodule_overallstatus IS NOT NULL ORDER BY 1"
+            ),
+            "study_types": _fetch(
+                "SELECT DISTINCT protocolsection_designmodule_studytype "
+                "FROM base WHERE protocolsection_designmodule_studytype IS NOT NULL ORDER BY 1"
+            ),
+            "countries": _fetch(
+                f"SELECT DISTINCT {COUNTRY_COL} "
+                f"FROM location WHERE {COUNTRY_COL} IS NOT NULL ORDER BY 1"
+            ),
+        }
+
+    # ------------------------------------------------------------------
+    # Query builder
+    # ------------------------------------------------------------------
+
+    def _build_filter_cte(self, phases=None, statuses=None, countries=None,
+                          study_types=None, sponsor=None):
         """
-
-
-        return self.con.execute(query).df()
-
-    def get_overview_data(self, phases):
+        Returns a WITH clause that resolves to filtered_trials(nctid).
+        Only adds JOINs for active filters to keep S3 pushdown efficient.
         """
-        Аналитика для Overview: защита от дублирования строк (Fan-out trap)
-        за счет использования CTE (WITH filtered_trials).
-        """
-        # Формируем строку для IN (...): 'Phase 1', 'Phase 2'
-        phases_sql = ", ".join([f"'{p}'" for p in phases])
+        joins = []
+        conditions = ["1=1"]
 
-        # 1. CTE: Находим уникальные NCT ID для выбранных фаз
-        # Это мгновенно отсечет миллионы ненужных строк в S3
-        base_cte = f"""
+        if phases:
+            joins.append(
+                "JOIN phases p "
+                "ON b.protocolsection_identificationmodule_nctid "
+                "= p.protocolsection_identificationmodule_nctid"
+            )
+            sql = ", ".join(f"'{p}'" for p in phases)
+            conditions.append(f"p.protocolsection_designmodule_phases IN ({sql})")
+
+        if statuses:
+            sql = ", ".join(f"'{s}'" for s in statuses)
+            conditions.append(
+                f"b.protocolsection_statusmodule_overallstatus IN ({sql})"
+            )
+
+        if study_types:
+            sql = ", ".join(f"'{t}'" for t in study_types)
+            conditions.append(f"b.protocolsection_designmodule_studytype IN ({sql})")
+
+        if sponsor:
+            safe = sponsor.replace("'", "''")
+            conditions.append(f"b.{SPONSOR_COL} ILIKE '%{safe}%'")
+
+        if countries:
+            joins.append(
+                "JOIN location l "
+                "ON b.protocolsection_identificationmodule_nctid "
+                "= l.protocolsection_identificationmodule_nctid"
+            )
+            sql = ", ".join(f"'{c}'" for c in countries)
+            conditions.append(f"l.{COUNTRY_COL} IN ({sql})")
+
+        joins_sql = "\n            ".join(joins)
+        where_sql  = " AND ".join(conditions)
+
+        return f"""
             WITH filtered_trials AS (
-                SELECT DISTINCT protocolsection_identificationmodule_nctid AS nctid
-                FROM phases
+                SELECT DISTINCT b.protocolsection_identificationmodule_nctid AS nctid
+                FROM base b
+                {joins_sql}
+                WHERE {where_sql}
             )
         """
 
-        # 2. Расчет KPI (Только таблица base + наш фильтр)
-        kpi_query = f"""
+    # ------------------------------------------------------------------
+    # Main data method
+    # ------------------------------------------------------------------
+
+    def get_overview_data(self, phases=None, statuses=None, countries=None,
+                          study_types=None, sponsor=None):
+        base_cte = self._build_filter_cte(phases, statuses, countries, study_types, sponsor)
+        delayed_sql = ", ".join(f"'{s}'" for s in DELAYED_STATUSES)
+
+        # ── KPIs ──────────────────────────────────────────────────────
+        kpi_row = self.con.execute(f"""
             {base_cte}
-            SELECT 
-                COUNT(b.protocolsection_identificationmodule_nctid) as total_trials,
-                SUM(b.protocolsection_designmodule_enrollmentinfo_count) as total_enrollment,
-                SUM(b.hasresults) as trials_with_results,
-                SUM(CASE WHEN b.protocolsection_statusmodule_overallstatus ILIKE '%COMPLETED%' THEN 1 ELSE 0 END) as completed_trials
+            SELECT
+                COUNT(b.protocolsection_identificationmodule_nctid)                        AS total_trials,
+                SUM(b.protocolsection_designmodule_enrollmentinfo_count)                   AS total_enrollment,
+                SUM(b.hasresults)                                                          AS trials_with_results,
+                SUM(CASE WHEN b.protocolsection_statusmodule_overallstatus = 'COMPLETED'
+                         THEN 1 ELSE 0 END)                                                AS completed_trials,
+                MAX(b.protocolsection_statusmodule_lastupdatepostdatestruct_date)          AS last_update
             FROM base b
-            JOIN filtered_trials ft ON b.protocolsection_identificationmodule_nctid = ft.nctid
-        """
-        kpis_raw = self.con.execute(kpi_query).fetchone()
+            JOIN filtered_trials ft
+              ON b.protocolsection_identificationmodule_nctid = ft.nctid
+        """).fetchone()
 
-        # Распаковываем и форматируем KPI (защита от None, если данных нет)
-        total_trials = kpis_raw[0] if kpis_raw[0] else 0
-        enrollment = kpis_raw[1] if kpis_raw[1] else 0
-        has_results = kpis_raw[2] if kpis_raw[2] else 0
-        completed = kpis_raw[3] if kpis_raw[3] else 0
+        total   = kpi_row[0] or 0
+        enroll  = kpi_row[1] or 0
+        results = kpi_row[2] or 0
+        done    = kpi_row[3] or 0
+        raw_date = kpi_row[4] or ""
 
-        # Считаем проценты для UI
-        pct_results = round((has_results / total_trials * 100), 1) if total_trials > 0 else 0
-        pct_completed = round((completed / total_trials * 100), 1) if total_trials > 0 else 0
+        pct_results  = round(results / total * 100, 1) if total else 0
+        pct_complete = round(done    / total * 100, 1) if total else 0
 
-        # 3. Данные для Donut Chart (Распределение по статусам)
-        status_query = f"""
-            {base_cte}
-            SELECT 
-                b.protocolsection_statusmodule_overallstatus as status,
-                COUNT(b.protocolsection_identificationmodule_nctid) as count
-            FROM base b
-            JOIN filtered_trials ft ON b.protocolsection_identificationmodule_nctid = ft.nctid
-            GROUP BY 1
-            ORDER BY 2 DESC
-        """
-        df_status = self.con.execute(status_query).df()
-
-        # 4. Данные для Geo Bar Chart (Таблица location + наш фильтр)
-        # ВНИМАНИЕ: Замени 'YOUR_COUNTRY_COLUMN' на реальное имя обрезанной колонки
-        country_col = "protocolsection_contactslocationsmodule_locations_country"  # Предположительное имя
-
-        geo_query = f"""
-            {base_cte}
-            SELECT 
-                l.{country_col} AS country,
-                COUNT(DISTINCT l.protocolsection_identificationmodule_nctid) as count
-            FROM location l
-            JOIN filtered_trials ft ON l.protocolsection_identificationmodule_nctid = ft.nctid
-            WHERE l.{country_col} IS NOT NULL
-            GROUP BY 1
-            ORDER BY 2 DESC
-            LIMIT 15
-        """
-
+        # Format last update
         try:
-            df_geo = self.con.execute(geo_query).df()
+            dt = datetime.strptime(raw_date[:10], "%Y-%m-%d")
+            last_update_str = dt.strftime("%b %d, %Y")
+        except Exception:
+            last_update_str = raw_date or "N/A"
+
+        # Compact enrollment label (123.42M / 4.5K / 999)
+        def _fmt_enrollment(n):
+            if n >= 1_000_000:
+                return f"{n / 1_000_000:.2f}M"
+            if n >= 1_000:
+                return f"{n / 1_000:.1f}K"
+            return f"{n:,.0f}"
+
+        # ── Delay Status donut ────────────────────────────────────────
+        df_delay = self.con.execute(f"""
+            {base_cte}
+            SELECT
+                CASE WHEN b.protocolsection_statusmodule_overallstatus IN ({delayed_sql})
+                     THEN 'Delayed' ELSE 'On Track' END AS status_group,
+                COUNT(*) AS count
+            FROM base b
+            JOIN filtered_trials ft
+              ON b.protocolsection_identificationmodule_nctid = ft.nctid
+            GROUP BY 1
+        """).df()
+
+        # ── Sex Distribution donut ────────────────────────────────────
+        df_sex = self.con.execute(f"""
+            {base_cte}
+            SELECT
+                UPPER(b.protocolsection_eligibilitymodule_sex) AS sex,
+                COUNT(*) AS count
+            FROM base b
+            JOIN filtered_trials ft
+              ON b.protocolsection_identificationmodule_nctid = ft.nctid
+            WHERE b.protocolsection_eligibilitymodule_sex IS NOT NULL
+            GROUP BY 1
+            ORDER BY 2 DESC
+        """).df()
+
+        # ── Status Distribution bar ───────────────────────────────────
+        df_status = self.con.execute(f"""
+            {base_cte}
+            SELECT
+                b.protocolsection_statusmodule_overallstatus AS status,
+                COUNT(*) AS count
+            FROM base b
+            JOIN filtered_trials ft
+              ON b.protocolsection_identificationmodule_nctid = ft.nctid
+            GROUP BY 1
+            ORDER BY 2 DESC
+        """).df()
+
+        # ── GeoMap ───────────────────────────────────────────────────
+        try:
+            df_geo = self.con.execute(f"""
+                {base_cte}
+                SELECT
+                    l.{COUNTRY_COL} AS country,
+                    COUNT(DISTINCT l.protocolsection_identificationmodule_nctid) AS count
+                FROM location l
+                JOIN filtered_trials ft
+                  ON l.protocolsection_identificationmodule_nctid = ft.nctid
+                WHERE l.{COUNTRY_COL} IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
         except Exception as e:
-            print(f"Ошибка чтения Location. Убедитесь, что колонка страны называется верно: {e}")
+            print(f"Geo query error: {e}")
             df_geo = None
 
-        # Отдаем готовый словарь в Dash
+        # ── Top 25 Sponsors ───────────────────────────────────────────
+        try:
+            df_sponsors = self.con.execute(f"""
+                {base_cte}
+                SELECT
+                    b.{SPONSOR_COL} AS sponsor,
+                    COUNT(*) AS count
+                FROM base b
+                JOIN filtered_trials ft
+                  ON b.protocolsection_identificationmodule_nctid = ft.nctid
+                WHERE b.{SPONSOR_COL} IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 25
+            """).df()
+        except Exception as e:
+            print(f"Sponsor query error: {e}")
+            df_sponsors = None
+
+        # ── Table (first 500 rows) ────────────────────────────────────
+        try:
+            df_table = self.con.execute(f"""
+                {base_cte},
+                agg_phases AS (
+                    SELECT
+                        protocolsection_identificationmodule_nctid AS nctid,
+                        STRING_AGG(DISTINCT protocolsection_designmodule_phases, ', ') AS phase
+                    FROM phases
+                    GROUP BY 1
+                ),
+                agg_loc AS (
+                    SELECT
+                        protocolsection_identificationmodule_nctid AS nctid,
+                        MIN({COUNTRY_COL}) AS country
+                    FROM location
+                    GROUP BY 1
+                )
+                SELECT
+                    b.protocolsection_identificationmodule_nctid                      AS nctid,
+                    regexp_extract(b.protocolsection_statusmodule_startdatestruct_date,
+                                   '\\d{{4}}')                                         AS year,
+                    b.protocolsection_statusmodule_completiondatestruct_date           AS completion,
+                    b.protocolsection_identificationmodule_brieftitle                  AS title,
+                    b.protocolsection_statusmodule_overallstatus                       AS status,
+                    ap.phase,
+                    b.protocolsection_designmodule_studytype                           AS study_type,
+                    b.{SPONSOR_COL}                                                    AS sponsor,
+                    al.country
+                FROM base b
+                JOIN filtered_trials ft
+                  ON b.protocolsection_identificationmodule_nctid = ft.nctid
+                LEFT JOIN agg_phases ap
+                  ON b.protocolsection_identificationmodule_nctid = ap.nctid
+                LEFT JOIN agg_loc al
+                  ON b.protocolsection_identificationmodule_nctid = al.nctid
+                ORDER BY b.protocolsection_identificationmodule_nctid
+                LIMIT 500
+            """).df()
+            # Make NCT ID a clickable markdown link
+            df_table["nctid"] = df_table["nctid"].apply(
+                lambda x: f"[{x}](https://clinicaltrials.gov/study/{x})"
+            )
+        except Exception as e:
+            print(f"Table query error: {e}")
+            df_table = None
+
         return {
-            "kpi_trials": f"{total_trials:,}",
-            "kpi_enrollment": f"{enrollment:,.0f}",
-            "kpi_results": f"{pct_results}%",
-            "kpi_completion": f"{pct_completed}%",
-            "status_dist": df_status,
-            "geo_dist": df_geo
+            "kpi_trials":      f"{total:,}",
+            "kpi_enrollment":  _fmt_enrollment(enroll),
+            "kpi_results":     f"{pct_results}%",
+            "kpi_results_sub": f"{int(results):,} Records",
+            "kpi_completion":  f"{pct_complete}%",
+            "last_update":     last_update_str,
+            "delay_dist":      df_delay,
+            "sex_dist":        df_sex,
+            "status_dist":     df_status,
+            "geo_dist":        df_geo,
+            "sponsor_dist":    df_sponsors,
+            "table_data":      df_table,
         }
 
 
-# Singleton instance to be used across the app
 engine = DataEngine()
