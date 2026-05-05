@@ -1,4 +1,4 @@
-from dash import dcc, html, callback, Input, Output, State, dash_table
+from dash import dcc, html, callback, Input, Output, State, dash_table, ctx
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
@@ -77,7 +77,6 @@ def _label(text):
                          "letterSpacing": "0.5px", "color": "#888"})
 
 
-# Intervention type color palette (consistent across treemap/stacked bar)
 _INT_PALETTE = [
     "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
     "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac", "#499894",
@@ -90,6 +89,9 @@ opts = engine.filter_options
 
 def render_layout():
     return html.Div([
+
+        # Cross-filter state store
+        dcc.Store(id="int-type-filter", data=None),
 
         # Header
         dbc.Card([
@@ -173,10 +175,35 @@ def render_layout():
                               "bi-heart-pulse-fill", "linear-gradient(135deg,#f6d365,#fda085)"), width=3),
         ], className="mb-4 g-3", style={"paddingTop": "4px"}),
 
-        # Treemap + Dynamics
+        # Treemap (with cross-filter badge) + Dynamics
         dbc.Row([
-            dbc.Col(_chart_card("Intervention Types",
-                                "int-chart-treemap", 350), width=5),
+            dbc.Col(
+                dbc.Card([
+                    dbc.CardHeader(
+                        html.Div([
+                            html.Span("Intervention Types", className="fw-semibold",
+                                      style={"fontSize": "0.95rem", "color": "#333"}),
+                            html.Span(
+                                id="int-type-active-badge",
+                                n_clicks=0,
+                                className="badge ms-2",
+                                style={"backgroundColor": "#4e79a7", "color": "white",
+                                       "fontSize": "0.75rem", "cursor": "pointer",
+                                       "display": "none"},
+                            ),
+                        ], className="d-flex align-items-center"),
+                        className="bg-white border-0 pt-3 pb-0",
+                    ),
+                    dbc.CardBody(dcc.Loading(
+                        dcc.Graph(id="int-chart-treemap", style={"height": "350px"},
+                                  config={"displayModeBar": False}),
+                        color="#9b9be4",
+                    )),
+                ], className="shadow-sm border-0 h-100",
+                   style={"borderRadius": "12px", "border": "none",
+                          "boxShadow": "0 2px 10px rgba(0,0,0,0.07)"}),
+                width=5,
+            ),
             dbc.Col(_chart_card("Dynamics of Trials by Intervention Type",
                                 "int-chart-dynamics", 350), width=7),
         ], className="mb-4 g-3"),
@@ -276,7 +303,39 @@ def render_layout():
     ], style={"padding": "6px 8px"})
 
 
-# ── Callback ──────────────────────────────────────────────────────────────────
+# ── Cross-filter callbacks ─────────────────────────────────────────────────────
+
+@callback(
+    Output("int-type-filter", "data"),
+    Input("int-chart-treemap",      "clickData"),
+    Input("int-type-active-badge",  "n_clicks"),
+    State("int-type-filter",        "data"),
+    prevent_initial_call=True,
+)
+def handle_type_filter(click_data, _badge_clicks, current_filter):
+    triggered = ctx.triggered_id
+    if triggered == "int-type-active-badge":
+        return None  # badge click = clear filter
+    if click_data is None:
+        return current_filter
+    clicked = click_data["points"][0].get("label") or click_data["points"][0].get("id")
+    return None if clicked == current_filter else clicked
+
+
+@callback(
+    Output("int-type-active-badge", "children"),
+    Output("int-type-active-badge", "style"),
+    Input("int-type-filter", "data"),
+)
+def update_type_badge(type_filter):
+    base_style = {"backgroundColor": "#4e79a7", "color": "white",
+                  "fontSize": "0.75rem", "cursor": "pointer"}
+    if type_filter:
+        return f"✕ {type_filter}", {**base_style, "display": "inline-block"}
+    return "", {**base_style, "display": "none"}
+
+
+# ── Main data callback ─────────────────────────────────────────────────────────
 
 @callback(
     Output("int-kpi-trials",              "children"),
@@ -293,6 +352,7 @@ def render_layout():
     Output("int-table",                   "tooltip_data"),
     Input("apply-filters-btn",            "n_clicks"),
     Input("int-apply-btn",                "n_clicks"),
+    Input("int-type-filter",              "data"),
     State("phase-dropdown",               "value"),
     State("status-dropdown",              "value"),
     State("country-dropdown",             "value"),
@@ -303,7 +363,8 @@ def render_layout():
     State("int-sem3-dropdown",            "value"),
     State("int-name-input",               "value"),
 )
-def update_interventions(_, __, phases, statuses, countries, study_types, sponsor,
+def update_interventions(_, __, type_filter,
+                         phases, statuses, countries, study_types, sponsor,
                          sem1, sem2, sem3, int_name):
     data = engine.get_interventions_data(
         phases=phases or [],
@@ -315,20 +376,36 @@ def update_interventions(_, __, phases, statuses, countries, study_types, sponso
         sem_level_2=sem2 or [],
         sem_level_3=sem3 or [],
         int_name=int_name or "",
+        int_type_filter=type_filter,
     )
 
     # ── Intervention Types treemap ────────────────────────────────────
     df_types = data.get("int_types")
     if df_types is not None and not df_types.empty:
-        fig_treemap = px.treemap(
-            df_types, path=["int_type"], values="count",
-            color="count",
-            color_continuous_scale=[[0, "#d6eaf8"], [1, "#1a5276"]],
-        )
-        fig_treemap.update_traces(
-            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
-            textfont_size=13,
-        )
+        # Dim non-selected types when a cross-filter is active
+        if type_filter:
+            colors = [
+                "#1a5276" if t == type_filter else "#d6eaf8"
+                for t in df_types["int_type"]
+            ]
+            fig_treemap = go.Figure(go.Treemap(
+                labels=df_types["int_type"].tolist(),
+                parents=[""] * len(df_types),
+                values=df_types["count"].tolist(),
+                marker_colors=colors,
+                hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
+                textfont_size=13,
+            ))
+        else:
+            fig_treemap = px.treemap(
+                df_types, path=["int_type"], values="count",
+                color="count",
+                color_continuous_scale=[[0, "#d6eaf8"], [1, "#1a5276"]],
+            )
+            fig_treemap.update_traces(
+                hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
+                textfont_size=13,
+            )
         fig_treemap.update_layout(
             margin=dict(t=10, b=10, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)",
@@ -410,7 +487,7 @@ def update_interventions(_, __, phases, statuses, countries, study_types, sponso
     else:
         fig_top_cond = _empty_fig()
 
-    # ── Word Cloud (treemap of top 50 names, pink scale) ──────────────
+    # ── Word Cloud (treemap of top 50, pink scale) ────────────────────
     df_wc = data.get("wordcloud")
     if df_wc is not None and not df_wc.empty:
         fig_wc = px.treemap(

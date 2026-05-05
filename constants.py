@@ -7,6 +7,7 @@ TABLES = {
     "location":      f"{S3_BUCKET}/locations/*.parquet",
     "phases":        f"{S3_BUCKET}/phases/*.parquet",
     "interventions": f"{S3_BUCKET}/arm_inerventions/arm_interventions_parquet3_full_light.parquet",
+    "conditions":    f"{S3_BUCKET}/conditions/derivedsection_conditions_lvl.parquet",
 }
 
 # Long ClinicalTrials.gov column name aliases
@@ -14,6 +15,7 @@ SPONSOR_COL           = "protocolsection_sponsorcollaboratorsmodule_leadsponsor_
 COUNTRY_COL           = "protocolsection_contactslocationsmodule_locations_country"
 INTERVENTION_TYPE_COL = "protocolsection_armsinterventionsmodule_interventions_type"
 INTERVENTION_NAME_COL = "protocolsection_armsinterventionsmodule_interventions_name"
+CONDITIONS_NAME_COL   = "condition_name"
 
 # Business logic — statuses that count as "Delayed"
 DELAYED_STATUSES = [
