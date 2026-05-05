@@ -361,7 +361,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
                 showland=True, landcolor="#f0f0f0",
                 showocean=True, oceancolor="white",
                 showlakes=False,
-                showborders=True, bordercolor="#e0e0e0", borderwidth=0.3,
+                showcountries=True, countrycolor="#e0e0e0", countrywidth=0.3,
                 projection_type="natural earth",
             ),
             coloraxis_showscale=False,
