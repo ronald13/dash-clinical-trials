@@ -254,8 +254,6 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         sponsor=sponsor or "",
     )
 
-    _hover_cfg = dict(bgcolor="white", font_size=12, bordercolor="#eee")
-
     # ── Delay Status donut ────────────────────────────────────────────
     df_delay = data["delay_dist"]
     if df_delay is not None and not df_delay.empty:
@@ -273,8 +271,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
-            hoverlabel=_hover_cfg,
-        )
+                    )
     else:
         fig_delay = _empty_fig()
 
@@ -295,8 +292,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
-            hoverlabel=_hover_cfg,
-        )
+                    )
     else:
         fig_sex = _empty_fig()
 
@@ -315,11 +311,12 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>% of total: %{customdata[0]:.1f}%<extra></extra>",
         )
         fig_status.update_layout(
-            yaxis={"categoryorder": "total ascending", "title": "", "tickfont": {"size": 11}},
+            yaxis={"categoryorder": "total ascending", "title": "",
+                   "tickfont": {"size": 11}, "ticklabelstandoff": 8},
             xaxis={"title": "", "showticklabels": False},
             margin=dict(t=10, b=10, l=10, r=55),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            bargap=0.3, hoverlabel=_hover_cfg,
+            bargap=0.3,
         )
     else:
         fig_status = _empty_fig()
@@ -372,8 +369,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             projection_type="natural earth",
         ),
             coloraxis_showscale=False,
-            hoverlabel=_hover_cfg,
-        )
+                    )
     else:
         fig_geo = _empty_fig("No geodata")
 
@@ -392,11 +388,12 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>% of total: %{customdata[0]:.1f}%<extra></extra>",
         )
         fig_sponsors.update_layout(
-            yaxis={"categoryorder": "total ascending", "title": "", "tickfont": {"size": 11}},
+            yaxis={"categoryorder": "total ascending", "title": "",
+                   "tickfont": {"size": 11}, "ticklabelstandoff": 8},
             xaxis={"title": "", "showticklabels": False},
             margin=dict(t=10, b=10, l=10, r=55),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            bargap=0.25, hoverlabel=_hover_cfg,
+            bargap=0.25,
         )
     else:
         fig_sponsors = _empty_fig("No sponsor data")
@@ -404,8 +401,11 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
     # ── Trial Duration by Phase ───────────────────────────────────────
     df_dur = data.get("duration_dist")
     if df_dur is not None and not df_dur.empty:
-        # Sort by canonical phase order, unknown phases go to bottom
         df_dur = df_dur.copy()
+        # Remove unknown/unspecified phases
+        df_dur = df_dur[~df_dur["phase"].isin(["N/A", "NA"])]
+
+    if df_dur is not None and not df_dur.empty:
         df_dur["_order"] = df_dur["phase"].apply(
             lambda p: _PHASE_ORDER.index(p) if p in _PHASE_ORDER else 99
         )
@@ -417,7 +417,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             custom_data=["median_months", "avg_months", "trial_count"],
         )
         fig_dur.update_traces(
-            text=[f"{v:.0f} mo" for v in df_dur["median_months"]],
+            text=[f"{v:.0f}" for v in df_dur["median_months"]],
             textposition="outside", cliponaxis=False,
             hovertemplate=(
                 "<b>%{y}</b><br>"
@@ -433,8 +433,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             xaxis={"title": "Median duration (months)", "tickfont": {"size": 11}},
             margin=dict(t=10, b=30, l=10, r=65),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            showlegend=False, bargap=0.4, hoverlabel=_hover_cfg,
-        )
+            showlegend=False, bargap=0.4,         )
     else:
         fig_dur = _empty_fig("No duration data (dates missing or not completed)")
 

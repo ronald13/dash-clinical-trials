@@ -245,6 +245,15 @@ class DataEngine:
             df_sponsors = None
 
         # ── Table (first 500 rows) ────────────────────────────────────
+        # When country filter is active, restrict agg_loc to selected countries
+        # so the Country column in the table shows the filtered country, not an
+        # unrelated one from the same multi-country trial.
+        if countries:
+            loc_country_sql = ", ".join(f"'{c}'" for c in countries)
+            loc_where = f"WHERE {COUNTRY_COL} IN ({loc_country_sql})"
+        else:
+            loc_where = ""
+
         try:
             df_table = self.con.execute(f"""
                 {base_cte},
@@ -260,6 +269,7 @@ class DataEngine:
                         protocolsection_identificationmodule_nctid AS nctid,
                         MIN({COUNTRY_COL}) AS country
                     FROM location
+                    {loc_where}
                     GROUP BY 1
                 )
                 SELECT
