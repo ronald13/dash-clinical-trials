@@ -123,17 +123,22 @@ class DataEngine:
                 SUM(b.hasresults)                                                          AS trials_with_results,
                 SUM(CASE WHEN b.protocolsection_statusmodule_overallstatus = 'COMPLETED'
                          THEN 1 ELSE 0 END)                                                AS completed_trials,
-                MAX(b.protocolsection_statusmodule_lastupdatepostdatestruct_date)          AS last_update
+                MAX(b.protocolsection_statusmodule_lastupdatepostdatestruct_date)          AS last_update,
+                COUNT(CASE WHEN regexp_extract(
+                    b.protocolsection_statusmodule_studyfirstpostdatestruct_date, '\\d{{4}}')
+                    = CAST(YEAR(CURRENT_DATE) - 1 AS VARCHAR)
+                    THEN 1 END)                                                             AS new_last_year
             FROM base b
             JOIN filtered_trials ft
               ON b.protocolsection_identificationmodule_nctid = ft.nctid
         """).fetchone()
 
-        total   = kpi_row[0] or 0
-        enroll  = kpi_row[1] or 0
-        results = kpi_row[2] or 0
-        done    = kpi_row[3] or 0
-        raw_date = kpi_row[4] or ""
+        total        = kpi_row[0] or 0
+        enroll       = kpi_row[1] or 0
+        results      = kpi_row[2] or 0
+        done         = kpi_row[3] or 0
+        raw_date     = kpi_row[4] or ""
+        new_last_year = kpi_row[5] or 0
 
         pct_results  = round(results / total * 100, 1) if total else 0
         pct_complete = round(done    / total * 100, 1) if total else 0
@@ -258,7 +263,8 @@ class DataEngine:
                     ap.phase,
                     b.protocolsection_designmodule_studytype                           AS study_type,
                     b.{SPONSOR_COL}                                                    AS sponsor,
-                    al.country
+                    al.country,
+                    CAST(b.protocolsection_designmodule_enrollmentinfo_count AS BIGINT) AS enrollment
                 FROM base b
                 JOIN filtered_trials ft
                   ON b.protocolsection_identificationmodule_nctid = ft.nctid
@@ -277,8 +283,12 @@ class DataEngine:
             print(f"Table query error: {e}")
             df_table = None
 
+        prev_year = datetime.now().year - 1
+        new_label = f"+ {new_last_year:,} new in {prev_year}"
+
         return {
             "kpi_trials":      f"{total:,}",
+            "kpi_trials_new":  new_label,
             "kpi_enrollment":  _fmt_enrollment(enroll),
             "kpi_results":     f"{pct_results}%",
             "kpi_results_sub": f"{int(results):,} Records",
