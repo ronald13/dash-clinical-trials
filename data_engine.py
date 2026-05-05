@@ -199,6 +199,14 @@ class DataEngine:
         """).df()
 
         # ── GeoMap ───────────────────────────────────────────────────
+        # When countries filter is active, restrict geo to only those countries
+        # (otherwise geo would show ALL locations of Kazakhstan-filtered trials)
+        if countries:
+            geo_country_sql = ", ".join(f"'{c}'" for c in countries)
+            geo_country_filter = f"AND l.{COUNTRY_COL} IN ({geo_country_sql})"
+        else:
+            geo_country_filter = ""
+
         try:
             df_geo = self.con.execute(f"""
                 {base_cte}
@@ -209,6 +217,7 @@ class DataEngine:
                 JOIN filtered_trials ft
                   ON l.protocolsection_identificationmodule_nctid = ft.nctid
                 WHERE l.{COUNTRY_COL} IS NOT NULL
+                  {geo_country_filter}
                 GROUP BY 1
                 ORDER BY 2 DESC
             """).df()
@@ -283,6 +292,45 @@ class DataEngine:
             print(f"Table query error: {e}")
             df_table = None
 
+        # ── Trial Duration by Phase ───────────────────────────────────
+        try:
+            df_duration = self.con.execute(f"""
+                {base_cte},
+                agg_ph_dur AS (
+                    SELECT protocolsection_identificationmodule_nctid AS nctid,
+                           MIN(protocolsection_designmodule_phases) AS phase
+                    FROM phases GROUP BY 1
+                ),
+                dur AS (
+                    SELECT
+                        COALESCE(ap.phase, 'N/A') AS phase,
+                        DATEDIFF('day',
+                            TRY_CAST(b.protocolsection_statusmodule_startdatestruct_date AS DATE),
+                            TRY_CAST(b.protocolsection_statusmodule_completiondatestruct_date AS DATE)
+                        ) / 30.44 AS duration_months
+                    FROM base b
+                    JOIN filtered_trials ft
+                      ON b.protocolsection_identificationmodule_nctid = ft.nctid
+                    LEFT JOIN agg_ph_dur ap
+                      ON b.protocolsection_identificationmodule_nctid = ap.nctid
+                    WHERE DATEDIFF('day',
+                        TRY_CAST(b.protocolsection_statusmodule_startdatestruct_date AS DATE),
+                        TRY_CAST(b.protocolsection_statusmodule_completiondatestruct_date AS DATE)
+                    ) BETWEEN 1 AND 18250
+                )
+                SELECT
+                    phase,
+                    ROUND(MEDIAN(duration_months), 1) AS median_months,
+                    ROUND(AVG(duration_months), 1)    AS avg_months,
+                    COUNT(*)                           AS trial_count
+                FROM dur
+                GROUP BY 1
+                ORDER BY median_months DESC
+            """).df()
+        except Exception as e:
+            print(f"Duration query error: {e}")
+            df_duration = None
+
         prev_year = datetime.now().year - 1
         new_label = f"+ {new_last_year:,} new in {prev_year}"
 
@@ -300,6 +348,7 @@ class DataEngine:
             "geo_dist":        df_geo,
             "sponsor_dist":    df_sponsors,
             "table_data":      df_table,
+            "duration_dist":   df_duration,
         }
 
 
