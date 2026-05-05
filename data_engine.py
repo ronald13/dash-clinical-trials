@@ -432,13 +432,17 @@ class DataEngine:
         unique_int  = kpi_row[1] or 0
         unique_cond = kpi_row[2] or 0
 
-        enroll_row = self.con.execute(f"""
-            {full_cte}
-            SELECT SUM(b.protocolsection_designmodule_enrollmentinfo_count)
-            FROM base b
-            JOIN int_trials it ON b.protocolsection_identificationmodule_nctid = it.nctid
-        """).fetchone()
-        enroll = enroll_row[0] or 0
+        try:
+            enroll_row = self.con.execute(f"""
+                {full_cte}
+                SELECT SUM(b.protocolsection_designmodule_enrollmentinfo_count)
+                FROM base b
+                JOIN int_trials it ON b.protocolsection_identificationmodule_nctid = it.nctid
+            """).fetchone()
+            enroll = (enroll_row[0] or 0) if enroll_row else 0
+        except Exception as e:
+            print(f"Int enrollment error: {e}")
+            enroll = 0
 
         def _fmt_n(n):
             if n >= 1_000_000: return f"{n / 1_000_000:.2f}M"
