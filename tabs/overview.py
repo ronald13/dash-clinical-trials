@@ -7,6 +7,17 @@ from data_engine import engine
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _fmt_label(v):
+    """Smart number label: avoids '0.00K' for small values."""
+    if v is None:
+        return ""
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    return str(int(v))
+
+
 def _empty_fig(msg="No data"):
     fig = go.Figure()
     fig.add_annotation(text=msg, showarrow=False, font={"size": 14, "color": "#bbb"})
@@ -67,6 +78,15 @@ def _kpi_card(title, value_id, icon_cls, gradient,
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
+# Phase display order for duration chart
+_PHASE_ORDER = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "NA", "N/A"]
+_PHASE_COLORS = {
+    "PHASE1": "#4e79a7", "PHASE2": "#f28e2b",
+    "PHASE3": "#e15759", "PHASE4": "#76b7b2",
+    "NA": "#bab0ac",     "N/A":  "#bab0ac",
+}
+
+
 def render_layout():
     return html.Div([
 
@@ -88,7 +108,7 @@ def render_layout():
            style={"borderRadius": "12px", "border": "none",
                   "boxShadow": "0 2px 10px rgba(0,0,0,0.07)"}),
 
-        # KPI row — pt-1 so box-shadow on top isn't clipped
+        # KPI row
         dbc.Row([
             dbc.Col(_kpi_card(
                 "Total Trials", "kpi-trials", "bi-activity",
@@ -165,15 +185,15 @@ def render_layout():
                     },
                     style_data={"border": "1px solid #f5f5f5"},
                     style_data_conditional=[
-                        {"if": {"filter_query": '{status} = "COMPLETED"',         "column_id": "status"},
+                        {"if": {"filter_query": '{status} = "COMPLETED"',          "column_id": "status"},
                          "color": "#27ae60", "fontWeight": "600"},
-                        {"if": {"filter_query": '{status} = "RECRUITING"',        "column_id": "status"},
+                        {"if": {"filter_query": '{status} = "RECRUITING"',         "column_id": "status"},
                          "color": "#2980b9", "fontWeight": "600"},
-                        {"if": {"filter_query": '{status} = "TERMINATED"',        "column_id": "status"},
+                        {"if": {"filter_query": '{status} = "TERMINATED"',         "column_id": "status"},
                          "color": "#c0392b", "fontWeight": "600"},
-                        {"if": {"filter_query": '{status} = "WITHDRAWN"',         "column_id": "status"},
+                        {"if": {"filter_query": '{status} = "WITHDRAWN"',          "column_id": "status"},
                          "color": "#e67e22", "fontWeight": "600"},
-                        {"if": {"filter_query": '{status} = "NOT_YET_RECRUITING"',"column_id": "status"},
+                        {"if": {"filter_query": '{status} = "NOT_YET_RECRUITING"', "column_id": "status"},
                          "color": "#8e44ad", "fontWeight": "600"},
                         {"if": {"row_index": "odd"}, "backgroundColor": "#fafafa"},
                     ],
@@ -190,32 +210,40 @@ def render_layout():
             dbc.Col(_chart_card("Top 25 Sponsors", "chart-sponsors", 380), width=6),
         ], className="mb-4 g-3"),
 
+        # Trial Duration Analysis
+        dbc.Row([
+            dbc.Col(_chart_card(
+                "Trial Duration by Phase — median months from start to completion",
+                "chart-duration-bar", 320), width=12),
+        ], className="mb-4 g-3"),
+
     ], style={"padding": "6px 8px"})
 
 
 # ── Callback ──────────────────────────────────────────────────────────────────
 
 @callback(
-    Output("kpi-trials",        "children"),
-    Output("kpi-trials-new",    "children"),
-    Output("kpi-enrollment",    "children"),
-    Output("kpi-results",       "children"),
-    Output("kpi-results-sub",   "children"),
-    Output("kpi-completion",    "children"),
-    Output("last-update-date",  "children"),
-    Output("chart-delay-donut", "figure"),
-    Output("chart-sex-donut",   "figure"),
-    Output("chart-status-bar",  "figure"),
-    Output("trials-table",      "data"),
-    Output("trials-table",      "tooltip_data"),
-    Output("chart-geomap",      "figure"),
-    Output("chart-sponsors",    "figure"),
-    Input("apply-filters-btn",  "n_clicks"),
-    State("phase-dropdown",     "value"),
-    State("status-dropdown",    "value"),
-    State("country-dropdown",   "value"),
-    State("study-type-dropdown","value"),
-    State("sponsor-input",      "value"),
+    Output("kpi-trials",         "children"),
+    Output("kpi-trials-new",     "children"),
+    Output("kpi-enrollment",     "children"),
+    Output("kpi-results",        "children"),
+    Output("kpi-results-sub",    "children"),
+    Output("kpi-completion",     "children"),
+    Output("last-update-date",   "children"),
+    Output("chart-delay-donut",  "figure"),
+    Output("chart-sex-donut",    "figure"),
+    Output("chart-status-bar",   "figure"),
+    Output("trials-table",       "data"),
+    Output("trials-table",       "tooltip_data"),
+    Output("chart-geomap",       "figure"),
+    Output("chart-sponsors",     "figure"),
+    Output("chart-duration-bar", "figure"),
+    Input("apply-filters-btn",   "n_clicks"),
+    State("phase-dropdown",      "value"),
+    State("status-dropdown",     "value"),
+    State("country-dropdown",    "value"),
+    State("study-type-dropdown", "value"),
+    State("sponsor-input",       "value"),
 )
 def update_overview(_, phases, statuses, countries, study_types, sponsor):
     data = engine.get_overview_data(
@@ -226,24 +254,26 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         sponsor=sponsor or "",
     )
 
+    _hover_cfg = dict(bgcolor="white", font_size=12, bordercolor="#eee")
+
     # ── Delay Status donut ────────────────────────────────────────────
     df_delay = data["delay_dist"]
     if df_delay is not None and not df_delay.empty:
-        total_k = f"{df_delay['count'].sum() / 1000:.2f}K"
+        total_k = _fmt_label(df_delay["count"].sum())
         DELAY_COLORS = {"On Track": "#5bc0de", "Delayed": "#1a5276"}
         fig_delay = px.pie(df_delay, names="status_group", values="count", hole=0.65,
                            color="status_group", color_discrete_map=DELAY_COLORS)
         fig_delay.update_traces(
             textinfo="none",
-            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<br>Share: %{percent}<extra></extra>",
+            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<br>% of total: %{percent}<extra></extra>",
         )
         fig_delay.add_annotation(text=total_k, x=0.5, y=0.5,
                                   font=dict(size=18, color="#333"), showarrow=False)
         fig_delay.update_layout(
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center",
-                        font=dict(size=11)),
+            legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
+            hoverlabel=_hover_cfg,
         )
     else:
         fig_delay = _empty_fig()
@@ -251,21 +281,21 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
     # ── Sex Distribution donut ────────────────────────────────────────
     df_sex = data["sex_dist"]
     if df_sex is not None and not df_sex.empty:
-        total_k = f"{df_sex['count'].sum() / 1000:.1f}K"
+        total_k = _fmt_label(df_sex["count"].sum())
         SEX_COLORS = {"ALL": "#5bc0de", "FEMALE": "#1a5276", "MALE": "#f0a500"}
         fig_sex = px.pie(df_sex, names="sex", values="count", hole=0.65,
                          color="sex", color_discrete_map=SEX_COLORS)
         fig_sex.update_traces(
             textinfo="none",
-            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<br>Share: %{percent}<extra></extra>",
+            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<br>% of total: %{percent}<extra></extra>",
         )
         fig_sex.add_annotation(text=total_k, x=0.5, y=0.5,
                                 font=dict(size=18, color="#333"), showarrow=False)
         fig_sex.update_layout(
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center",
-                        font=dict(size=11)),
+            legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
+            hoverlabel=_hover_cfg,
         )
     else:
         fig_sex = _empty_fig()
@@ -276,22 +306,20 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         df_status = df_status.copy()
         total_s = df_status["count"].sum()
         df_status["pct"] = (df_status["count"] / total_s * 100).round(1)
-        labels = [f"{v / 1000:.2f}K" for v in df_status["count"]]
         fig_status = px.bar(df_status, x="count", y="status", orientation="h",
                             color_discrete_sequence=["#9b9be4"],
                             custom_data=["pct"])
         fig_status.update_traces(
-            text=labels, textposition="outside", cliponaxis=False,
-            hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>Share: %{customdata[0]:.1f}%<extra></extra>",
+            text=[_fmt_label(v) for v in df_status["count"]],
+            textposition="outside", cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>% of total: %{customdata[0]:.1f}%<extra></extra>",
         )
         fig_status.update_layout(
-            yaxis={"categoryorder": "total ascending", "title": "",
-                   "tickfont": {"size": 11}},
+            yaxis={"categoryorder": "total ascending", "title": "", "tickfont": {"size": 11}},
             xaxis={"title": "", "showticklabels": False},
-            margin=dict(t=10, b=10, l=10, r=65),
+            margin=dict(t=10, b=10, l=10, r=55),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            bargap=0.3,
-            hoverlabel=dict(bgcolor="white", font_size=12),
+            bargap=0.3, hoverlabel=_hover_cfg,
         )
     else:
         fig_status = _empty_fig()
@@ -323,19 +351,16 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
                 "Trials: %{customdata[1]:,}<br>"
-                "Share: %{customdata[2]:.1f}%"
+                "% of total: %{customdata[2]:.1f}%"
                 "<extra></extra>"
             ),
-            marker_line_color="white",
-            marker_line_width=0.5,
+            marker_line_color="white", marker_line_width=0.5,
         )
         fig_geo.update_layout(
             margin=dict(t=0, b=0, l=0, r=0),
             paper_bgcolor="white",
             geo=dict(
-                bgcolor="white",
-                showframe=False,
-                showcoastlines=False,
+                bgcolor="white", showframe=False, showcoastlines=False,
                 showland=True, landcolor="#f0f0f0",
                 showocean=True, oceancolor="white",
                 showlakes=False,
@@ -343,7 +368,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
                 projection_type="natural earth",
             ),
             coloraxis_showscale=False,
-            hoverlabel=dict(bgcolor="white", font_size=12),
+            hoverlabel=_hover_cfg,
         )
     else:
         fig_geo = _empty_fig("No geodata")
@@ -354,25 +379,60 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         df_sponsors = df_sponsors.copy()
         total_sp = df_sponsors["count"].sum()
         df_sponsors["pct"] = (df_sponsors["count"] / total_sp * 100).round(1)
-        labels = [f"{v / 1000:.2f}K" for v in df_sponsors["count"]]
         fig_sponsors = px.bar(df_sponsors, x="count", y="sponsor", orientation="h",
                               color_discrete_sequence=["#f0a500"],
                               custom_data=["pct"])
         fig_sponsors.update_traces(
-            text=labels, textposition="outside", cliponaxis=False,
-            hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>Share: %{customdata[0]:.1f}%<extra></extra>",
+            text=[_fmt_label(v) for v in df_sponsors["count"]],
+            textposition="outside", cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>Trials: %{x:,.0f}<br>% of total: %{customdata[0]:.1f}%<extra></extra>",
         )
         fig_sponsors.update_layout(
-            yaxis={"categoryorder": "total ascending", "title": "",
-                   "tickfont": {"size": 11}},
+            yaxis={"categoryorder": "total ascending", "title": "", "tickfont": {"size": 11}},
             xaxis={"title": "", "showticklabels": False},
-            margin=dict(t=10, b=10, l=10, r=65),
+            margin=dict(t=10, b=10, l=10, r=55),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            bargap=0.25,
-            hoverlabel=dict(bgcolor="white", font_size=12),
+            bargap=0.25, hoverlabel=_hover_cfg,
         )
     else:
         fig_sponsors = _empty_fig("No sponsor data")
+
+    # ── Trial Duration by Phase ───────────────────────────────────────
+    df_dur = data.get("duration_dist")
+    if df_dur is not None and not df_dur.empty:
+        # Sort by canonical phase order, unknown phases go to bottom
+        df_dur = df_dur.copy()
+        df_dur["_order"] = df_dur["phase"].apply(
+            lambda p: _PHASE_ORDER.index(p) if p in _PHASE_ORDER else 99
+        )
+        df_dur = df_dur.sort_values("_order", ascending=False)
+
+        fig_dur = px.bar(
+            df_dur, x="median_months", y="phase", orientation="h",
+            color="phase", color_discrete_map=_PHASE_COLORS,
+            custom_data=["median_months", "avg_months", "trial_count"],
+        )
+        fig_dur.update_traces(
+            text=[f"{v:.0f} mo" for v in df_dur["median_months"]],
+            textposition="outside", cliponaxis=False,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Median: %{customdata[0]:.1f} months<br>"
+                "Average: %{customdata[1]:.1f} months<br>"
+                "Trials used: %{customdata[2]:,}"
+                "<extra></extra>"
+            ),
+        )
+        fig_dur.update_layout(
+            yaxis={"title": "", "tickfont": {"size": 12}, "categoryorder": "array",
+                   "categoryarray": list(reversed(df_dur["phase"].tolist()))},
+            xaxis={"title": "Median duration (months)", "tickfont": {"size": 11}},
+            margin=dict(t=10, b=30, l=10, r=65),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            showlegend=False, bargap=0.4, hoverlabel=_hover_cfg,
+        )
+    else:
+        fig_dur = _empty_fig("No duration data (dates missing or not completed)")
 
     return (
         data["kpi_trials"],
@@ -389,4 +449,5 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         tooltip_data,
         fig_geo,
         fig_sponsors,
+        fig_dur,
     )
