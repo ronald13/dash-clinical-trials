@@ -333,15 +333,17 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=0, b=0, l=0, r=0),
             paper_bgcolor="white",
             geo=dict(
-                bgcolor="white",
-                showframe=False,
-                showcoastlines=False,
-                showland=True, landcolor="#f0f0f0",
-                showocean=True, oceancolor="white",
-                showlakes=False,
-                showborders=True, bordercolor="#e0e0e0", borderwidth=0.3,
-                projection_type="natural earth",
-            ),
+            bgcolor="white",
+            showframe=False,
+            showcoastlines=False,
+            showland=True, landcolor="#f0f0f0",
+            showocean=True, oceancolor="white",
+            showlakes=False,
+            showcountries=True,        # ← вместо showborders
+            countrycolor="#e0e0e0",    # ← вместо bordercolor
+            # borderwidth не нужен — толщина линий страновых границ не настраивается
+            projection_type="natural earth",
+        ),
             coloraxis_showscale=False,
             hoverlabel=dict(bgcolor="white", font_size=12),
         )
