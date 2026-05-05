@@ -1,7 +1,8 @@
 import duckdb
 from datetime import datetime
 from aws_client import setup_duckdb_s3
-from constants import TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES
+from constants import (TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES,
+                       INTERVENTION_TYPE_COL, INTERVENTION_NAME_COL)
 
 
 class DataEngine:
@@ -45,6 +46,18 @@ class DataEngine:
             "countries": _fetch(
                 f"SELECT DISTINCT {COUNTRY_COL} "
                 f"FROM location WHERE {COUNTRY_COL} IS NOT NULL ORDER BY 1"
+            ),
+            "int_sem_level_1": _fetch(
+                "SELECT DISTINCT sem_level_1 FROM interventions "
+                "WHERE sem_level_1 IS NOT NULL ORDER BY 1"
+            ),
+            "int_sem_level_2": _fetch(
+                "SELECT DISTINCT sem_level_2 FROM interventions "
+                "WHERE sem_level_2 IS NOT NULL ORDER BY 1"
+            ),
+            "int_sem_level_3": _fetch(
+                "SELECT DISTINCT sem_level_3 FROM interventions "
+                "WHERE sem_level_3 IS NOT NULL ORDER BY 1"
             ),
         }
 
@@ -359,6 +372,225 @@ class DataEngine:
             "sponsor_dist":    df_sponsors,
             "table_data":      df_table,
             "duration_dist":   df_duration,
+        }
+
+
+    def get_interventions_data(self, phases=None, statuses=None, countries=None,
+                               study_types=None, sponsor=None,
+                               sem_level_1=None, sem_level_2=None, sem_level_3=None,
+                               int_name=None):
+        base_cte = self._build_filter_cte(phases, statuses, countries, study_types, sponsor)
+
+        # Interventions-specific WHERE conditions
+        int_conditions = ["1=1"]
+        if sem_level_1:
+            v_sql = ", ".join(f"'{v}'" for v in sem_level_1)
+            int_conditions.append(f"i.sem_level_1 IN ({v_sql})")
+        if sem_level_2:
+            v_sql = ", ".join(f"'{v}'" for v in sem_level_2)
+            int_conditions.append(f"i.sem_level_2 IN ({v_sql})")
+        if sem_level_3:
+            v_sql = ", ".join(f"'{v}'" for v in sem_level_3)
+            int_conditions.append(f"i.sem_level_3 IN ({v_sql})")
+        if int_name:
+            safe = int_name.replace("'", "''")
+            int_conditions.append(f"i.{INTERVENTION_NAME_COL} ILIKE '%{safe}%'")
+        int_where = " AND ".join(int_conditions)
+
+        full_cte = base_cte.rstrip() + f""",
+        filtered_interventions AS (
+            SELECT
+                i.protocolsection_identificationmodule_nctid AS nctid,
+                i.{INTERVENTION_TYPE_COL}                    AS int_type,
+                i.{INTERVENTION_NAME_COL}                    AS int_name,
+                i.entity_canonical_name,
+                i.armgrouplabel,
+                i.sem_level_1,
+                i.sem_level_2,
+                i.sem_level_3
+            FROM interventions i
+            JOIN filtered_trials ft
+              ON i.protocolsection_identificationmodule_nctid = ft.nctid
+            WHERE {int_where}
+        ),
+        int_trials AS (
+            SELECT DISTINCT nctid FROM filtered_interventions
+        )
+        """
+
+        # ── KPIs ──────────────────────────────────────────────────────
+        kpi_row = self.con.execute(f"""
+            {full_cte}
+            SELECT
+                COUNT(DISTINCT nctid)                AS total_trials,
+                COUNT(DISTINCT int_name)             AS unique_interventions,
+                COUNT(DISTINCT entity_canonical_name) AS unique_conditions
+            FROM filtered_interventions
+        """).fetchone()
+
+        total       = kpi_row[0] or 0
+        unique_int  = kpi_row[1] or 0
+        unique_cond = kpi_row[2] or 0
+
+        enroll_row = self.con.execute(f"""
+            {full_cte}
+            SELECT SUM(b.protocolsection_designmodule_enrollmentinfo_count)
+            FROM base b
+            JOIN int_trials it ON b.protocolsection_identificationmodule_nctid = it.nctid
+        """).fetchone()
+        enroll = enroll_row[0] or 0
+
+        def _fmt_n(n):
+            if n >= 1_000_000: return f"{n / 1_000_000:.2f}M"
+            if n >= 1_000:     return f"{n / 1_000:.1f}K"
+            return f"{n:,.0f}"
+
+        # ── Intervention Types (treemap) ───────────────────────────────
+        try:
+            df_types = self.con.execute(f"""
+                {full_cte}
+                SELECT int_type, COUNT(DISTINCT nctid) AS count
+                FROM filtered_interventions
+                WHERE int_type IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Int types error: {e}"); df_types = None
+
+        # ── Dynamics stacked bar ───────────────────────────────────────
+        try:
+            df_dynamics = self.con.execute(f"""
+                {full_cte}
+                SELECT
+                    regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date,
+                        '\\d{{4}}'
+                    )                        AS year,
+                    fi.int_type,
+                    COUNT(DISTINCT fi.nctid) AS count
+                FROM filtered_interventions fi
+                JOIN base b
+                  ON fi.nctid = b.protocolsection_identificationmodule_nctid
+                WHERE fi.int_type IS NOT NULL
+                  AND regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                      ) >= '2000'
+                GROUP BY 1, 2
+                ORDER BY 1
+            """).df()
+        except Exception as e:
+            print(f"Dynamics error: {e}"); df_dynamics = None
+
+        # ── Top 25 Interventions ───────────────────────────────────────
+        try:
+            df_top_int = self.con.execute(f"""
+                {full_cte}
+                SELECT int_name, COUNT(DISTINCT nctid) AS count
+                FROM filtered_interventions
+                WHERE int_name IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 25
+            """).df()
+        except Exception as e:
+            print(f"Top interventions error: {e}"); df_top_int = None
+
+        # ── Top 25 Conditions ──────────────────────────────────────────
+        try:
+            df_top_cond = self.con.execute(f"""
+                {full_cte}
+                SELECT entity_canonical_name AS condition, COUNT(DISTINCT nctid) AS count
+                FROM filtered_interventions
+                WHERE entity_canonical_name IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 25
+            """).df()
+        except Exception as e:
+            print(f"Top conditions error: {e}"); df_top_cond = None
+
+        # ── Word Cloud (top 50 by raw count for size weighting) ────────
+        try:
+            df_wordcloud = self.con.execute(f"""
+                {full_cte}
+                SELECT int_name, COUNT(*) AS count
+                FROM filtered_interventions
+                WHERE int_name IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 50
+            """).df()
+        except Exception as e:
+            print(f"Word cloud error: {e}"); df_wordcloud = None
+
+        # ── GeoMap ────────────────────────────────────────────────────
+        if countries:
+            geo_filter = "AND l." + COUNTRY_COL + " IN (" + ", ".join(f"'{c}'" for c in countries) + ")"
+        else:
+            geo_filter = ""
+        try:
+            df_geo = self.con.execute(f"""
+                {full_cte}
+                SELECT
+                    l.{COUNTRY_COL} AS country,
+                    COUNT(DISTINCT l.protocolsection_identificationmodule_nctid) AS count
+                FROM location l
+                JOIN int_trials it ON l.protocolsection_identificationmodule_nctid = it.nctid
+                WHERE l.{COUNTRY_COL} IS NOT NULL {geo_filter}
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Int geo error: {e}"); df_geo = None
+
+        # ── Data Table ────────────────────────────────────────────────
+        try:
+            df_table = self.con.execute(f"""
+                {full_cte},
+                agg_phases AS (
+                    SELECT
+                        protocolsection_identificationmodule_nctid AS nctid,
+                        STRING_AGG(DISTINCT protocolsection_designmodule_phases, ', ') AS phase
+                    FROM phases GROUP BY 1
+                )
+                SELECT
+                    fi.nctid,
+                    regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                    )                                                             AS year,
+                    b.protocolsection_identificationmodule_brieftitle             AS title,
+                    b.protocolsection_statusmodule_overallstatus                  AS status,
+                    ap.phase,
+                    b.protocolsection_designmodule_studytype                      AS study_type,
+                    fi.int_type,
+                    fi.armgrouplabel                                               AS arm_label,
+                    fi.int_name,
+                    CAST(b.protocolsection_designmodule_enrollmentinfo_count AS BIGINT) AS enrollment
+                FROM filtered_interventions fi
+                JOIN base b ON fi.nctid = b.protocolsection_identificationmodule_nctid
+                LEFT JOIN agg_phases ap ON fi.nctid = ap.nctid
+                ORDER BY fi.nctid
+                LIMIT 500
+            """).df()
+            df_table["nctid"] = df_table["nctid"].apply(
+                lambda x: f"[{x}](https://clinicaltrials.gov/study/{x})"
+            )
+        except Exception as e:
+            print(f"Int table error: {e}"); df_table = None
+
+        return {
+            "kpi_trials":        f"{total:,}",
+            "kpi_enrollment":    _fmt_n(enroll),
+            "kpi_unique_int":    f"{unique_int:,}",
+            "kpi_unique_cond":   f"{unique_cond:,}",
+            "int_types":         df_types,
+            "int_dynamics":      df_dynamics,
+            "top_interventions": df_top_int,
+            "top_conditions":    df_top_cond,
+            "wordcloud":         df_wordcloud,
+            "geo_dist":          df_geo,
+            "table_data":        df_table,
         }
 
 
