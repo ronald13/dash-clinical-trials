@@ -77,10 +77,29 @@ def _label(text):
                          "letterSpacing": "0.5px", "color": "#888"})
 
 
-_INT_PALETTE = [
-    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
-    "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac", "#499894",
-]
+# Fixed color map — same type always gets the same color on every chart
+_INT_TYPE_COLORS = {
+    "DRUG":                "#e15759",
+    "DEVICE":              "#4e79a7",
+    "BIOLOGICAL":          "#f28e2b",
+    "PROCEDURE":           "#76b7b2",
+    "BEHAVIORAL":          "#59a14f",
+    "DIAGNOSTIC_TEST":     "#edc948",
+    "DIETARY_SUPPLEMENT":  "#b07aa1",
+    "GENETIC":             "#ff9da7",
+    "COMBINATION_PRODUCT": "#9c755f",
+    "OTHER":               "#bab0ac",
+    "RADIATION":           "#499894",
+    "No Intervention":     "#d3d3d3",
+}
+_INT_FALLBACK = ["#6ca6cd", "#ffd700", "#90ee90", "#dda0dd", "#87ceeb", "#f4a460", "#cd853f"]
+
+
+def _int_color(int_type):
+    """Return a stable color for any intervention type, known or unknown."""
+    if int_type in _INT_TYPE_COLORS:
+        return _INT_TYPE_COLORS[int_type]
+    return _INT_FALLBACK[hash(int_type) % len(_INT_FALLBACK)]
 
 opts = engine.filter_options
 
@@ -382,34 +401,26 @@ def update_interventions(_, __, type_filter,
     # ── Intervention Types treemap ────────────────────────────────────
     df_types = data.get("int_types")
     if df_types is not None and not df_types.empty:
-        # Dim non-selected types when a cross-filter is active
+        types_list  = df_types["int_type"].tolist()
+        values_list = df_types["count"].tolist()
         if type_filter:
-            colors = [
-                "#1a5276" if t == type_filter else "#d6eaf8"
-                for t in df_types["int_type"]
-            ]
-            fig_treemap = go.Figure(go.Treemap(
-                labels=df_types["int_type"].tolist(),
-                parents=[""] * len(df_types),
-                values=df_types["count"].tolist(),
-                marker_colors=colors,
-                hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
-                textfont_size=13,
-            ))
+            # Highlight selected type; dim all others
+            colors = [_int_color(t) if t == type_filter else "#e8e8e8"
+                      for t in types_list]
         else:
-            fig_treemap = px.treemap(
-                df_types, path=["int_type"], values="count",
-                color="count",
-                color_continuous_scale=[[0, "#d6eaf8"], [1, "#1a5276"]],
-            )
-            fig_treemap.update_traces(
-                hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
-                textfont_size=13,
-            )
+            colors = [_int_color(t) for t in types_list]
+
+        fig_treemap = go.Figure(go.Treemap(
+            labels=types_list,
+            parents=[""] * len(types_list),
+            values=values_list,
+            marker_colors=colors,
+            hovertemplate="<b>%{label}</b><br>Trials: %{value:,}<extra></extra>",
+            textfont_size=13,
+        ))
         fig_treemap.update_layout(
             margin=dict(t=10, b=10, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)",
-            coloraxis_showscale=False,
         )
     else:
         fig_treemap = _empty_fig()
@@ -417,10 +428,12 @@ def update_interventions(_, __, type_filter,
     # ── Dynamics stacked bar ──────────────────────────────────────────
     df_dyn = data.get("int_dynamics")
     if df_dyn is not None and not df_dyn.empty:
+        # Build color map from all types present so it matches the treemap
+        dyn_color_map = {t: _int_color(t) for t in df_dyn["int_type"].unique()}
         fig_dyn = px.bar(
             df_dyn, x="year", y="count", color="int_type",
             barmode="stack",
-            color_discrete_sequence=_INT_PALETTE,
+            color_discrete_map=dyn_color_map,
         )
         fig_dyn.update_traces(
             hovertemplate="<b>%{x}</b> — %{fullData.name}<br>Trials: %{y:,}<extra></extra>",
