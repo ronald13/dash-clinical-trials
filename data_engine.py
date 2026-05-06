@@ -19,18 +19,37 @@ class DataEngine:
     def _initialize_views(self):
         """Create lazy views for S3 Parquet files. No data is transferred yet."""
         for name, path in TABLES.items():
-            self.con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
+            try:
+                self.con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
+            except Exception as e:
+                print(f"View creation error for {name}: {e}")
 
     def _load_filter_options(self):
-        """Load unique values for each filter dropdown once at startup."""
+        """Load unique values for each filter dropdown once at startup.
+
+        Uses a dedicated temporary connection so any S3 failure during loading
+        cannot corrupt self.con (the main query connection).
+        """
+        try:
+            tmp = duckdb.connect(':memory:')
+            setup_duckdb_s3(tmp)
+            for name, path in TABLES.items():
+                try:
+                    tmp.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
+                except Exception as e:
+                    print(f"Filter-options view error ({name}): {e}")
+        except Exception as e:
+            print(f"Filter-options connection error: {e}")
+            return {}
+
         def _fetch(sql):
             try:
-                return [r[0] for r in self.con.execute(sql).fetchall()]
+                return [r[0] for r in tmp.execute(sql).fetchall()]
             except Exception as e:
                 print(f"Filter options load error: {e}")
                 return []
 
-        return {
+        result = {
             "phases": _fetch(
                 "SELECT DISTINCT protocolsection_designmodule_phases "
                 "FROM phases WHERE protocolsection_designmodule_phases IS NOT NULL ORDER BY 1"
@@ -60,6 +79,11 @@ class DataEngine:
                 "WHERE sem_level_3 IS NOT NULL ORDER BY 1"
             ),
         }
+        try:
+            tmp.close()
+        except Exception:
+            pass
+        return result
 
     # ------------------------------------------------------------------
     # Query builder
@@ -128,23 +152,30 @@ class DataEngine:
         delayed_sql = ", ".join(f"'{s}'" for s in DELAYED_STATUSES)
 
         # ── KPIs ──────────────────────────────────────────────────────
-        kpi_row = self.con.execute(f"""
-            {base_cte}
-            SELECT
-                COUNT(b.protocolsection_identificationmodule_nctid)                        AS total_trials,
-                SUM(b.protocolsection_designmodule_enrollmentinfo_count)                   AS total_enrollment,
-                SUM(b.hasresults)                                                          AS trials_with_results,
-                SUM(CASE WHEN b.protocolsection_statusmodule_overallstatus = 'COMPLETED'
-                         THEN 1 ELSE 0 END)                                                AS completed_trials,
-                MAX(b.protocolsection_statusmodule_lastupdatepostdatestruct_date)          AS last_update,
-                COUNT(CASE WHEN regexp_extract(
-                    b.protocolsection_statusmodule_studyfirstpostdatestruct_date, '\\d{{4}}')
-                    = CAST(YEAR(CURRENT_DATE) - 1 AS VARCHAR)
-                    THEN 1 END)                                                             AS new_last_year
-            FROM base b
-            JOIN filtered_trials ft
-              ON b.protocolsection_identificationmodule_nctid = ft.nctid
-        """).fetchone()
+        try:
+            kpi_row = self.con.execute(f"""
+                {base_cte}
+                SELECT
+                    COUNT(b.protocolsection_identificationmodule_nctid)                        AS total_trials,
+                    SUM(b.protocolsection_designmodule_enrollmentinfo_count)                   AS total_enrollment,
+                    SUM(b.hasresults)                                                          AS trials_with_results,
+                    SUM(CASE WHEN b.protocolsection_statusmodule_overallstatus = 'COMPLETED'
+                             THEN 1 ELSE 0 END)                                                AS completed_trials,
+                    MAX(b.protocolsection_statusmodule_lastupdatepostdatestruct_date)          AS last_update,
+                    COUNT(CASE WHEN regexp_extract(
+                        b.protocolsection_statusmodule_studyfirstpostdatestruct_date, '\\d{{4}}')
+                        = CAST(YEAR(CURRENT_DATE) - 1 AS VARCHAR)
+                        THEN 1 END)                                                             AS new_last_year
+                FROM base b
+                JOIN filtered_trials ft
+                  ON b.protocolsection_identificationmodule_nctid = ft.nctid
+            """).fetchone()
+        except Exception as e:
+            print(f"Overview KPI error: {e}")
+            kpi_row = None
+
+        if kpi_row is None:
+            kpi_row = (0, 0, 0, 0, "", 0)
 
         total        = kpi_row[0] or 0
         enroll       = kpi_row[1] or 0
