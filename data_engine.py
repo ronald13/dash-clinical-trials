@@ -80,6 +80,10 @@ class DataEngine:
                 "SELECT DISTINCT sem_level_3 FROM interventions "
                 "WHERE sem_level_3 IS NOT NULL ORDER BY 1"
             ),
+            "int_types": _fetch(
+                f"SELECT DISTINCT {INTERVENTION_TYPE_COL} FROM interventions "
+                f"WHERE {INTERVENTION_TYPE_COL} IS NOT NULL ORDER BY 1"
+            ),
         }
         try:
             tmp.close()
@@ -664,6 +668,279 @@ class DataEngine:
             "wordcloud":         df_wordcloud,
             "geo_dist":          df_geo,
             "table_data":        df_table,
+        }
+
+
+    def get_conditions_data(self, phases=None, statuses=None, countries=None,
+                            study_types=None, sponsor=None,
+                            int_type=None, cond_name=None,
+                            level1_filter=None):
+        with self._lock:
+            return self._get_conditions_data_impl(
+                phases, statuses, countries, study_types, sponsor,
+                int_type, cond_name, level1_filter,
+            )
+
+    def _get_conditions_data_impl(self, phases=None, statuses=None, countries=None,
+                                   study_types=None, sponsor=None,
+                                   int_type=None, cond_name=None,
+                                   level1_filter=None):
+        base_cte = self._build_filter_cte(phases, statuses, countries, study_types, sponsor)
+
+        # Optional: restrict filtered_trials to those with a specific intervention type
+        if int_type:
+            safe_type = int_type.replace("'", "''")
+            int_cte_sql = f""",
+        int_type_trials AS (
+            SELECT DISTINCT ft.nctid
+            FROM filtered_trials ft
+            JOIN interventions i
+              ON ft.nctid = i.protocolsection_identificationmodule_nctid
+            WHERE i.{INTERVENTION_TYPE_COL} = '{safe_type}'
+        )"""
+            join_src = "int_type_trials"
+        else:
+            int_cte_sql = ""
+            join_src = "filtered_trials"
+
+        # Base conditions WHERE (no level_1 filter — used for treemap)
+        cond_parts = ["1=1"]
+        if cond_name:
+            safe = cond_name.replace("'", "''")
+            cond_parts.append(f"c.condition_name ILIKE '%{safe}%'")
+        cond_where_base = " AND ".join(cond_parts)
+
+        # Typed WHERE adds level_1 cross-filter for non-treemap charts
+        if level1_filter:
+            safe = level1_filter.replace("'", "''")
+            cond_where_typed = cond_where_base + f" AND c.level_1 = '{safe}'"
+        else:
+            cond_where_typed = cond_where_base
+
+        def _make_full_cte(cond_where):
+            return base_cte.rstrip() + int_cte_sql + f""",
+        filtered_conditions AS (
+            SELECT
+                c.protocolsection_identificationmodule_nctid AS nctid,
+                c.condition_id,
+                c.condition_name,
+                COALESCE(c.level_1, 'Unclassified') AS level_1,
+                c.level_2
+            FROM conditions c
+            JOIN {join_src} ft
+              ON c.protocolsection_identificationmodule_nctid = ft.nctid
+            WHERE {cond_where}
+        ),
+        cond_trials AS (
+            SELECT DISTINCT nctid FROM filtered_conditions
+        )
+        """
+
+        full_cte_base  = _make_full_cte(cond_where_base)
+        full_cte_typed = _make_full_cte(cond_where_typed)
+
+        # ── KPIs ──────────────────────────────────────────────────────────
+        kpi_row = self.con.execute(f"""
+            {base_cte}
+            SELECT COUNT(*) FROM filtered_trials
+        """).fetchone()
+        total = (kpi_row[0] or 0) if kpi_row else 0
+
+        try:
+            enroll_row = self.con.execute(f"""
+                {base_cte}
+                SELECT SUM(b.protocolsection_designmodule_enrollmentinfo_count)
+                FROM base b
+                JOIN filtered_trials ft
+                  ON b.protocolsection_identificationmodule_nctid = ft.nctid
+            """).fetchone()
+            enroll = (enroll_row[0] or 0) if enroll_row else 0
+        except Exception as e:
+            print(f"Cond enrollment error: {e}"); enroll = 0
+
+        try:
+            uniq_row = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT COUNT(DISTINCT LOWER(TRIM(condition_name))),
+                       COUNT(DISTINCT level_1)
+                FROM filtered_conditions
+            """).fetchone()
+            unique_cond = (uniq_row[0] or 0) if uniq_row else 0
+            unique_cat  = (uniq_row[1] or 0) if uniq_row else 0
+        except Exception as e:
+            print(f"Cond uniq error: {e}"); unique_cond = unique_cat = 0
+
+        def _fmt_n(n):
+            if n >= 1_000_000: return f"{n / 1_000_000:.2f}M"
+            if n >= 1_000:     return f"{n / 1_000:.1f}K"
+            return f"{n:,.0f}"
+
+        # ── Conditions treemap (all categories, no level_1 cross-filter) ──
+        try:
+            df_tree = self.con.execute(f"""
+                {full_cte_base}
+                SELECT level_1, COUNT(DISTINCT nctid) AS count
+                FROM filtered_conditions
+                WHERE level_1 IS NOT NULL AND level_1 != 'Unclassified'
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Cond tree error: {e}"); df_tree = None
+
+        # ── Phase distribution grouped bar ────────────────────────────────
+        try:
+            df_phase = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT
+                    p.protocolsection_designmodule_phases AS phase,
+                    fc.level_1,
+                    COUNT(DISTINCT fc.nctid) AS count
+                FROM filtered_conditions fc
+                JOIN phases p
+                  ON fc.nctid = p.protocolsection_identificationmodule_nctid
+                WHERE fc.level_1 IS NOT NULL
+                  AND p.protocolsection_designmodule_phases IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 3 DESC
+            """).df()
+        except Exception as e:
+            print(f"Cond phase error: {e}"); df_phase = None
+
+        # ── Heatmap: level_1 × intervention type ──────────────────────────
+        try:
+            df_heatmap = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT
+                    fc.level_1,
+                    COALESCE(i.{INTERVENTION_TYPE_COL}, 'No Intervention') AS int_type,
+                    COUNT(DISTINCT fc.nctid) AS count
+                FROM filtered_conditions fc
+                LEFT JOIN interventions i
+                  ON fc.nctid = i.protocolsection_identificationmodule_nctid
+                WHERE fc.level_1 IS NOT NULL
+                GROUP BY 1, 2
+            """).df()
+        except Exception as e:
+            print(f"Cond heatmap error: {e}"); df_heatmap = None
+
+        # ── Top 25 conditions (deduped) ───────────────────────────────────
+        try:
+            df_top_cond = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT ANY_VALUE(condition_name) AS condition_name,
+                       COUNT(DISTINCT nctid) AS count
+                FROM filtered_conditions
+                WHERE condition_name IS NOT NULL
+                GROUP BY LOWER(TRIM(condition_name))
+                ORDER BY 2 DESC
+                LIMIT 25
+            """).df()
+        except Exception as e:
+            print(f"Cond top25 error: {e}"); df_top_cond = None
+
+        # ── Trend lines (top 8 categories by year) ────────────────────────
+        try:
+            df_trend = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT
+                    regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                    ) AS year,
+                    fc.level_1,
+                    COUNT(DISTINCT fc.nctid) AS count
+                FROM filtered_conditions fc
+                JOIN base b
+                  ON fc.nctid = b.protocolsection_identificationmodule_nctid
+                WHERE fc.level_1 IN (
+                    SELECT level_1 FROM filtered_conditions
+                    WHERE level_1 IS NOT NULL
+                    GROUP BY 1 ORDER BY COUNT(DISTINCT nctid) DESC LIMIT 8
+                )
+                  AND regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                      ) >= '2000'
+                  AND regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                      ) <= CAST(YEAR(CURRENT_DATE) AS VARCHAR)
+                GROUP BY 1, 2
+                ORDER BY 1
+            """).df()
+        except Exception as e:
+            print(f"Cond trend error: {e}"); df_trend = None
+
+        # ── Geo ───────────────────────────────────────────────────────────
+        if countries:
+            geo_filter = ("AND l." + COUNTRY_COL + " IN ("
+                          + ", ".join(f"'{c}'" for c in countries) + ")")
+        else:
+            geo_filter = ""
+        try:
+            df_geo = self.con.execute(f"""
+                {full_cte_typed}
+                SELECT l.{COUNTRY_COL} AS country,
+                       COUNT(DISTINCT l.protocolsection_identificationmodule_nctid) AS count
+                FROM location l
+                JOIN cond_trials ct
+                  ON l.protocolsection_identificationmodule_nctid = ct.nctid
+                WHERE l.{COUNTRY_COL} IS NOT NULL {geo_filter}
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Cond geo error: {e}"); df_geo = None
+
+        # ── Table ─────────────────────────────────────────────────────────
+        try:
+            df_table = self.con.execute(f"""
+                {full_cte_typed},
+                agg_phases AS (
+                    SELECT protocolsection_identificationmodule_nctid AS nctid,
+                           STRING_AGG(DISTINCT protocolsection_designmodule_phases, ', ') AS phase
+                    FROM phases GROUP BY 1
+                ),
+                agg_int AS (
+                    SELECT protocolsection_identificationmodule_nctid AS nctid,
+                           MIN({INTERVENTION_NAME_COL}) AS int_name,
+                           MIN(armgrouplabel)            AS int_description
+                    FROM interventions GROUP BY 1
+                )
+                SELECT
+                    fc.nctid,
+                    regexp_extract(
+                        b.protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                    )                                                        AS year,
+                    b.protocolsection_statusmodule_overallstatus             AS status,
+                    ap.phase,
+                    fc.condition_name,
+                    fc.condition_id,
+                    ai.int_name,
+                    ai.int_description
+                FROM filtered_conditions fc
+                JOIN base b ON fc.nctid = b.protocolsection_identificationmodule_nctid
+                LEFT JOIN agg_phases ap ON fc.nctid = ap.nctid
+                LEFT JOIN agg_int    ai ON fc.nctid = ai.nctid
+                ORDER BY fc.nctid
+                LIMIT 500
+            """).df()
+            df_table["nctid"] = df_table["nctid"].apply(
+                lambda x: f"[{x}](https://clinicaltrials.gov/study/{x})"
+            )
+        except Exception as e:
+            print(f"Cond table error: {e}"); df_table = None
+
+        return {
+            "kpi_trials":      f"{total:,}",
+            "kpi_enrollment":  _fmt_n(enroll),
+            "kpi_unique_cond": f"{unique_cond:,}",
+            "kpi_unique_cat":  f"{unique_cat:,}",
+            "cond_tree":       df_tree,
+            "phase_dist":      df_phase,
+            "heatmap":         df_heatmap,
+            "top_conditions":  df_top_cond,
+            "trend_lines":     df_trend,
+            "geo_dist":        df_geo,
+            "table_data":      df_table,
         }
 
 

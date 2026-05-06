@@ -1,7 +1,7 @@
 from dash import html
 import dash_bootstrap_components as dbc
 from app import app
-from tabs import overview, interventions
+from tabs import overview, interventions, conditions
 from data_engine import engine
 
 from dash import dcc
@@ -91,7 +91,7 @@ content = dbc.Col([
             dbc.Tab(
                 label="Conditions", tab_id="tab-conditions",
                 label_style=_tab_style, active_label_style=_tab_active_style,
-                children=[_coming_soon],
+                children=[conditions.render_layout()],
             ),
             dbc.Tab(
                 label="Interventions", tab_id="tab-interventions",
