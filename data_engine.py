@@ -1,4 +1,5 @@
 import duckdb
+import threading
 from datetime import datetime
 from aws_client import setup_duckdb_s3
 from constants import (TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES,
@@ -7,6 +8,7 @@ from constants import (TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES,
 
 class DataEngine:
     def __init__(self):
+        self._lock = threading.Lock()
         self.con = duckdb.connect(database=':memory:')
         setup_duckdb_s3(self.con)
         self._initialize_views()
@@ -148,6 +150,11 @@ class DataEngine:
 
     def get_overview_data(self, phases=None, statuses=None, countries=None,
                           study_types=None, sponsor=None):
+        with self._lock:
+            return self._get_overview_data_impl(phases, statuses, countries, study_types, sponsor)
+
+    def _get_overview_data_impl(self, phases=None, statuses=None, countries=None,
+                                study_types=None, sponsor=None):
         base_cte = self._build_filter_cte(phases, statuses, countries, study_types, sponsor)
         delayed_sql = ", ".join(f"'{s}'" for s in DELAYED_STATUSES)
 
@@ -410,6 +417,16 @@ class DataEngine:
                                study_types=None, sponsor=None,
                                sem_level_1=None, sem_level_2=None, sem_level_3=None,
                                int_name=None, int_type_filter=None):
+        with self._lock:
+            return self._get_interventions_data_impl(
+                phases, statuses, countries, study_types, sponsor,
+                sem_level_1, sem_level_2, sem_level_3, int_name, int_type_filter
+            )
+
+    def _get_interventions_data_impl(self, phases=None, statuses=None, countries=None,
+                                     study_types=None, sponsor=None,
+                                     sem_level_1=None, sem_level_2=None, sem_level_3=None,
+                                     int_name=None, int_type_filter=None):
         base_cte = self._build_filter_cte(phases, statuses, countries, study_types, sponsor)
 
         # sem_level + name conditions (no type filter — kept separate for treemap)
