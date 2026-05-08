@@ -3,7 +3,10 @@ import threading
 from datetime import datetime
 from aws_client import setup_duckdb_s3
 from constants import (TABLES, SPONSOR_COL, COUNTRY_COL, DELAYED_STATUSES,
-                       INTERVENTION_TYPE_COL, INTERVENTION_NAME_COL, CONDITIONS_NAME_COL)
+                       INTERVENTION_TYPE_COL, INTERVENTION_NAME_COL, CONDITIONS_NAME_COL,
+                       OUTCOME_TYPE_COL, OUTCOME_TITLE_COL, OUTCOME_PARAM_COL,
+                       OUTCOME_STATUS_COL, SPONSOR_CLASS_COL, PRIMARY_PURPOSE_COL,
+                       PHASE_COL, OVERALL_STATUS_COL)
 
 
 class DataEngine:
@@ -83,6 +86,22 @@ class DataEngine:
             "int_types": _fetch(
                 f"SELECT DISTINCT {INTERVENTION_TYPE_COL} FROM interventions "
                 f"WHERE {INTERVENTION_TYPE_COL} IS NOT NULL ORDER BY 1"
+            ),
+            "outcome_types": _fetch(
+                f"SELECT DISTINCT {OUTCOME_TYPE_COL} FROM outcomes "
+                f"WHERE {OUTCOME_TYPE_COL} IS NOT NULL ORDER BY 1"
+            ),
+            "sponsor_classes": _fetch(
+                f"SELECT DISTINCT {SPONSOR_CLASS_COL} FROM outcomes "
+                f"WHERE {SPONSOR_CLASS_COL} IS NOT NULL ORDER BY 1"
+            ),
+            "primary_purposes": _fetch(
+                f"SELECT DISTINCT {PRIMARY_PURPOSE_COL} FROM outcomes "
+                f"WHERE {PRIMARY_PURPOSE_COL} IS NOT NULL ORDER BY 1"
+            ),
+            "reporting_statuses": _fetch(
+                f"SELECT DISTINCT {OUTCOME_STATUS_COL} FROM outcomes "
+                f"WHERE {OUTCOME_STATUS_COL} IS NOT NULL ORDER BY 1"
             ),
         }
         try:
@@ -941,6 +960,236 @@ class DataEngine:
             "trend_lines":     df_trend,
             "geo_dist":        df_geo,
             "table_data":      df_table,
+        }
+
+
+    def get_outcomes_data(self, phases=None, statuses=None, countries=None,
+                          study_types=None, sponsor=None,
+                          outcome_type=None, sponsor_class=None,
+                          primary_purpose=None, reporting_status=None):
+        with self._lock:
+            return self._get_outcomes_data_impl(
+                phases, statuses, countries, study_types, sponsor,
+                outcome_type, sponsor_class, primary_purpose, reporting_status,
+            )
+
+    def _build_outcomes_where(self, phases=None, statuses=None, countries=None,
+                               study_types=None, sponsor=None,
+                               outcome_type=None, sponsor_class=None,
+                               primary_purpose=None, reporting_status=None):
+        """WHERE clause for the outcomes table (pre-joined, no CTEs needed)."""
+        c = ["1=1"]
+        if phases:
+            c.append(f"{PHASE_COL} IN ({', '.join(repr(p) for p in phases)})")
+        if statuses:
+            c.append(f"{OVERALL_STATUS_COL} IN ({', '.join(repr(s) for s in statuses)})")
+        if countries:
+            c.append(f"main_country IN ({', '.join(repr(x) for x in countries)})")
+        if study_types:
+            c.append(f"protocolsection_designmodule_studytype IN ({', '.join(repr(t) for t in study_types)})")
+        if sponsor:
+            c.append(f"{SPONSOR_COL} ILIKE '%{sponsor.replace(chr(39), chr(39)*2)}%'")
+        if outcome_type:
+            c.append(f"{OUTCOME_TYPE_COL} = '{outcome_type.replace(chr(39), chr(39)*2)}'")
+        if sponsor_class:
+            c.append(f"{SPONSOR_CLASS_COL} = '{sponsor_class.replace(chr(39), chr(39)*2)}'")
+        if primary_purpose:
+            c.append(f"{PRIMARY_PURPOSE_COL} = '{primary_purpose.replace(chr(39), chr(39)*2)}'")
+        if reporting_status:
+            c.append(f"{OUTCOME_STATUS_COL} = '{reporting_status.replace(chr(39), chr(39)*2)}'")
+        return " AND ".join(c)
+
+    def _get_outcomes_data_impl(self, phases=None, statuses=None, countries=None,
+                                 study_types=None, sponsor=None,
+                                 outcome_type=None, sponsor_class=None,
+                                 primary_purpose=None, reporting_status=None):
+        where = self._build_outcomes_where(
+            phases, statuses, countries, study_types, sponsor,
+            outcome_type, sponsor_class, primary_purpose, reporting_status,
+        )
+
+        def _fmt_n(n):
+            if n >= 1_000_000: return f"{n / 1_000_000:.2f}M"
+            if n >= 1_000:     return f"{n / 1_000:.1f}K"
+            return f"{n:,.0f}"
+
+        # ── KPIs ──────────────────────────────────────────────────────────
+        try:
+            k = self.con.execute(f"""
+                SELECT
+                    COUNT(DISTINCT protocolsection_identificationmodule_nctid) AS trials,
+                    COUNT(*)                                                    AS total_outcomes,
+                    SUM(CASE WHEN pvalue_mean < 0.05 THEN 1 ELSE 0 END)        AS significant,
+                    COUNT(CASE WHEN pvalue_mean IS NOT NULL THEN 1 END)         AS with_pvalue,
+                    MEDIAN(CASE WHEN pvalue_mean > 0 AND pvalue_mean <= 1
+                                THEN pvalue_mean END)                           AS median_pval
+                FROM outcomes
+                WHERE {where}
+            """).fetchone()
+            kpi_trials   = (k[0] or 0) if k else 0
+            kpi_total    = (k[1] or 0) if k else 0
+            kpi_sig      = (k[2] or 0) if k else 0
+            kpi_wpval    = (k[3] or 0) if k else 0
+            kpi_med_pval = round(k[4], 4) if k and k[4] is not None else None
+            pct_sig      = round(kpi_sig / kpi_wpval * 100, 1) if kpi_wpval else 0
+        except Exception as e:
+            print(f"Outcomes KPI error: {e}")
+            kpi_trials = kpi_total = kpi_sig = kpi_wpval = 0
+            kpi_med_pval = None; pct_sig = 0
+
+        # ── P-value histogram (20 bins) ────────────────────────────────────
+        try:
+            df_pval = self.con.execute(f"""
+                SELECT
+                    ROUND(FLOOR(pvalue_mean * 20) / 20.0, 2) AS bin,
+                    COUNT(*) AS count
+                FROM outcomes
+                WHERE {where}
+                  AND pvalue_mean IS NOT NULL
+                  AND pvalue_mean BETWEEN 0 AND 1
+                GROUP BY 1
+                ORDER BY 1
+            """).df()
+        except Exception as e:
+            print(f"Outcomes pval hist error: {e}"); df_pval = None
+
+        # ── Volcano plot: effect × p-value (up to 3000 pts) ───────────────
+        try:
+            df_volcano = self.con.execute(f"""
+                SELECT
+                    effect_mean,
+                    pvalue_mean,
+                    {OUTCOME_TYPE_COL} AS outcome_type,
+                    {OUTCOME_TITLE_COL} AS title
+                FROM outcomes
+                WHERE {where}
+                  AND effect_mean IS NOT NULL
+                  AND pvalue_mean  IS NOT NULL
+                  AND pvalue_mean  >  0
+                  AND ABS(effect_mean) < 20
+                ORDER BY RANDOM()
+                LIMIT 3000
+            """).df()
+        except Exception as e:
+            print(f"Outcomes volcano error: {e}"); df_volcano = None
+
+        # ── Reporting status by sponsor class ─────────────────────────────
+        try:
+            df_report = self.con.execute(f"""
+                SELECT
+                    COALESCE({SPONSOR_CLASS_COL}, 'UNKNOWN') AS sponsor_class,
+                    COALESCE({OUTCOME_STATUS_COL}, 'UNKNOWN') AS reporting_status,
+                    COUNT(*) AS count
+                FROM outcomes
+                WHERE {where}
+                GROUP BY 1, 2
+                ORDER BY 1, 3 DESC
+            """).df()
+        except Exception as e:
+            print(f"Outcomes reporting error: {e}"); df_report = None
+
+        # ── Phase × Significance ──────────────────────────────────────────
+        try:
+            df_phase_sig = self.con.execute(f"""
+                SELECT
+                    COALESCE({PHASE_COL}, 'N/A') AS phase,
+                    CASE WHEN pvalue_mean IS NULL  THEN 'UNKNOWN'
+                         WHEN pvalue_mean < 0.05   THEN 'SIGNIFICANT'
+                         ELSE 'NOT_SIGNIFICANT' END AS significance,
+                    COUNT(DISTINCT protocolsection_identificationmodule_nctid) AS count
+                FROM outcomes
+                WHERE {where} AND {PHASE_COL} IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1
+            """).df()
+        except Exception as e:
+            print(f"Outcomes phase×sig error: {e}"); df_phase_sig = None
+
+        # ── Outcome type donut ────────────────────────────────────────────
+        try:
+            df_otype = self.con.execute(f"""
+                SELECT
+                    COALESCE({OUTCOME_TYPE_COL}, 'UNKNOWN') AS outcome_type,
+                    COUNT(*) AS count
+                FROM outcomes
+                WHERE {where}
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Outcomes type error: {e}"); df_otype = None
+
+        # ── Param type bar ────────────────────────────────────────────────
+        try:
+            df_param = self.con.execute(f"""
+                SELECT
+                    COALESCE({OUTCOME_PARAM_COL}, 'UNKNOWN') AS param_type,
+                    COUNT(*) AS count
+                FROM outcomes
+                WHERE {where} AND {OUTCOME_PARAM_COL} IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+                LIMIT 15
+            """).df()
+        except Exception as e:
+            print(f"Outcomes param error: {e}"); df_param = None
+
+        # ── Geo ───────────────────────────────────────────────────────────
+        try:
+            df_geo = self.con.execute(f"""
+                SELECT main_country AS country,
+                       COUNT(DISTINCT protocolsection_identificationmodule_nctid) AS count
+                FROM outcomes
+                WHERE {where} AND main_country IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """).df()
+        except Exception as e:
+            print(f"Outcomes geo error: {e}"); df_geo = None
+
+        # ── Table ─────────────────────────────────────────────────────────
+        try:
+            df_table = self.con.execute(f"""
+                SELECT
+                    protocolsection_identificationmodule_nctid        AS nctid,
+                    regexp_extract(
+                        protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
+                    )                                                  AS year,
+                    {OUTCOME_TYPE_COL}                                 AS outcome_type,
+                    {OUTCOME_TITLE_COL}                                AS title,
+                    {OUTCOME_PARAM_COL}                                AS param_type,
+                    {OUTCOME_STATUS_COL}                               AS reporting_status,
+                    {PHASE_COL}                                        AS phase,
+                    ROUND(pvalue_mean, 4)                              AS pvalue,
+                    ROUND(effect_mean, 4)                              AS effect_size,
+                    main_country                                       AS country,
+                    {SPONSOR_COL}                                      AS sponsor,
+                    {SPONSOR_CLASS_COL}                                AS sponsor_class
+                FROM outcomes
+                WHERE {where}
+                ORDER BY nctid
+                LIMIT 500
+            """).df()
+            df_table["nctid"] = df_table["nctid"].apply(
+                lambda x: f"[{x}](https://clinicaltrials.gov/study/{x})"
+            )
+        except Exception as e:
+            print(f"Outcomes table error: {e}"); df_table = None
+
+        return {
+            "kpi_trials":     _fmt_n(kpi_trials),
+            "kpi_total":      _fmt_n(kpi_total),
+            "kpi_sig":        f"{pct_sig}%",
+            "kpi_sig_sub":    f"{_fmt_n(kpi_sig)} of {_fmt_n(kpi_wpval)} with p-value",
+            "kpi_med_pval":   f"{kpi_med_pval}" if kpi_med_pval is not None else "N/A",
+            "pval_hist":      df_pval,
+            "volcano":        df_volcano,
+            "reporting":      df_report,
+            "phase_sig":      df_phase_sig,
+            "outcome_types":  df_otype,
+            "param_types":    df_param,
+            "geo_dist":       df_geo,
+            "table_data":     df_table,
         }
 
 
