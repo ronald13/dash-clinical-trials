@@ -1152,9 +1152,9 @@ class DataEngine:
             df_table = self.con.execute(f"""
                 SELECT
                     protocolsection_identificationmodule_nctid        AS nctid,
-                    regexp_extract(
-                        protocolsection_statusmodule_startdatestruct_date, '\\d{{4}}'
-                    )                                                  AS year,
+                    CAST(YEAR(TRY_CAST(
+                        protocolsection_statusmodule_startdatestruct_date AS TIMESTAMP
+                    )) AS VARCHAR)                                     AS year,
                     {OUTCOME_TYPE_COL}                                 AS outcome_type,
                     {OUTCOME_TITLE_COL}                                AS title,
                     {OUTCOME_PARAM_COL}                                AS param_type,
