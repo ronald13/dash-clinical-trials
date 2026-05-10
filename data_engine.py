@@ -1011,7 +1011,7 @@ class DataEngine:
         def _fmt_n(n):
             if n >= 1_000_000: return f"{n / 1_000_000:.2f}M"
             if n >= 1_000:     return f"{n / 1_000:.1f}K"
-            return f"{n:,.0f}"
+            return str(int(n))
 
         # ── KPIs ──────────────────────────────────────────────────────────
         try:
@@ -1030,7 +1030,7 @@ class DataEngine:
             kpi_total    = (k[1] or 0) if k else 0
             kpi_sig      = (k[2] or 0) if k else 0
             kpi_wpval    = (k[3] or 0) if k else 0
-            kpi_med_pval = round(k[4], 4) if k and k[4] is not None else None
+            kpi_med_pval = round(k[4], 2) if k and k[4] is not None else None
             pct_sig      = round(kpi_sig / kpi_wpval * 100, 1) if kpi_wpval else 0
         except Exception as e:
             print(f"Outcomes KPI error: {e}")
@@ -1134,40 +1134,58 @@ class DataEngine:
         except Exception as e:
             print(f"Outcomes param error: {e}"); df_param = None
 
-        # ── Geo ───────────────────────────────────────────────────────────
+        # ── Geo: color by % significant outcomes per country ─────────────────
         try:
             df_geo = self.con.execute(f"""
-                SELECT main_country AS country,
-                       COUNT(DISTINCT protocolsection_identificationmodule_nctid) AS count
+                SELECT
+                    main_country AS country,
+                    COUNT(DISTINCT protocolsection_identificationmodule_nctid) AS trials,
+                    COUNT(CASE WHEN pvalue_mean IS NOT NULL THEN 1 END)         AS with_pval,
+                    SUM(CASE WHEN pvalue_mean < 0.05 THEN 1 ELSE 0 END)         AS significant,
+                    ROUND(
+                        SUM(CASE WHEN pvalue_mean < 0.05 THEN 1.0 ELSE 0.0 END)
+                        / NULLIF(COUNT(CASE WHEN pvalue_mean IS NOT NULL THEN 1 END), 0)
+                        * 100, 1
+                    ) AS pct_significant
                 FROM outcomes
                 WHERE {where} AND main_country IS NOT NULL
                 GROUP BY 1
-                ORDER BY 2 DESC
+                ORDER BY trials DESC
             """).df()
         except Exception as e:
             print(f"Outcomes geo error: {e}"); df_geo = None
 
-        # ── Table ─────────────────────────────────────────────────────────
+        # ── Table — one row per trial × outcome_title (deduped) ───────────
         try:
             df_table = self.con.execute(f"""
                 SELECT
-                    protocolsection_identificationmodule_nctid        AS nctid,
+                    protocolsection_identificationmodule_nctid         AS nctid,
                     CAST(YEAR(TRY_CAST(
-                        protocolsection_statusmodule_startdatestruct_date AS TIMESTAMP
-                    )) AS VARCHAR)                                     AS year,
-                    {OUTCOME_TYPE_COL}                                 AS outcome_type,
-                    {OUTCOME_TITLE_COL}                                AS title,
-                    {OUTCOME_PARAM_COL}                                AS param_type,
-                    {OUTCOME_STATUS_COL}                               AS reporting_status,
-                    {PHASE_COL}                                        AS phase,
-                    ROUND(pvalue_mean, 4)                              AS pvalue,
-                    ROUND(effect_mean, 4)                              AS effect_size,
-                    main_country                                       AS country,
-                    {SPONSOR_COL}                                      AS sponsor,
-                    {SPONSOR_CLASS_COL}                                AS sponsor_class
+                        MIN(protocolsection_statusmodule_startdatestruct_date) AS TIMESTAMP
+                    )) AS VARCHAR)                                      AS year,
+                    {OUTCOME_TYPE_COL}                                  AS outcome_type,
+                    {OUTCOME_TITLE_COL}                                 AS title,
+                    {OUTCOME_PARAM_COL}                                 AS param_type,
+                    {OUTCOME_STATUS_COL}                                AS reporting_status,
+                    {PHASE_COL}                                         AS phase,
+                    ROUND(MIN(pvalue_mean), 2)                          AS pvalue,
+                    ROUND(AVG(effect_mean), 2)                          AS effect_size,
+                    main_country                                        AS country,
+                    {SPONSOR_COL}                                       AS sponsor,
+                    {SPONSOR_CLASS_COL}                                 AS sponsor_class
                 FROM outcomes
                 WHERE {where}
-                ORDER BY nctid
+                GROUP BY
+                    protocolsection_identificationmodule_nctid,
+                    {OUTCOME_TYPE_COL},
+                    {OUTCOME_TITLE_COL},
+                    {OUTCOME_PARAM_COL},
+                    {OUTCOME_STATUS_COL},
+                    {PHASE_COL},
+                    main_country,
+                    {SPONSOR_COL},
+                    {SPONSOR_CLASS_COL}
+                ORDER BY 1
                 LIMIT 500
             """).df()
             df_table["nctid"] = df_table["nctid"].apply(

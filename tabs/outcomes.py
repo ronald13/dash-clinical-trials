@@ -237,7 +237,9 @@ def render_layout():
 
         # Geo full width
         dbc.Row([
-            dbc.Col(_chart_card("Geographic Distribution", "out-chart-geo", 300), width=12),
+            dbc.Col(_chart_card("Geographic Distribution",
+                            "out-chart-geo", 300,
+                            subtitle="color = % significant outcomes (p < 0.05)"), width=12),
         ], className="mb-4 g-3"),
 
         # Data Table
@@ -434,7 +436,7 @@ def update_outcomes(_, __,
         )
         fig_rep.update_layout(
             xaxis={"title": "", "tickfont": {"size": 11}},
-            yaxis={"title": "", "tickfont": {"size": 11}},
+            yaxis={"title": "", "tickfont": {"size": 11}, "ticklabelstandoff": 8},
             legend=dict(title="", orientation="h", y=-0.2, x=0.5, xanchor="center",
                         font=dict(size=10)),
             margin=dict(t=10, b=10, l=10, r=10),
@@ -468,16 +470,15 @@ def update_outcomes(_, __,
     # ── Phase × Significance horizontal stacked bar ───────────────────────
     df_ps = data.get("phase_sig")
     if df_ps is not None and not df_ps.empty:
-        color_map = {k: v for k, v in _SIG_COLORS.items()}
         fig_ps = px.bar(
             df_ps, y="phase", x="count", color="significance",
             orientation="h", barmode="stack",
-            color_discrete_map=color_map,
+            color_discrete_map=_SIG_COLORS,
         )
         fig_ps.update_layout(
             xaxis={"title": "", "tickfont": {"size": 11}},
             yaxis={"title": "", "tickfont": {"size": 11},
-                   "categoryorder": "total ascending"},
+                   "categoryorder": "total ascending", "ticklabelstandoff": 8},
             legend=dict(title="", orientation="h", y=-0.18, x=0.5, xanchor="center",
                         font=dict(size=10)),
             margin=dict(t=10, b=10, l=10, r=10),
@@ -498,7 +499,7 @@ def update_outcomes(_, __,
         )
         fig_param.update_layout(
             yaxis={"categoryorder": "total ascending", "title": "",
-                   "tickfont": {"size": 10}},
+                   "tickfont": {"size": 10}, "ticklabelstandoff": 8},
             xaxis={"title": "", "showticklabels": False},
             margin=dict(t=10, b=10, l=10, r=40),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -507,40 +508,51 @@ def update_outcomes(_, __,
     else:
         fig_param = _empty_fig()
 
-    # ── Geo ───────────────────────────────────────────────────────────────
+    # ── Geo: color = % significant outcomes per country ───────────────────
     df_geo = data.get("geo_dist")
     if df_geo is not None and not df_geo.empty:
         df_geo = df_geo.copy()
-        df_geo["pct"] = (df_geo["count"] / df_geo["count"].sum() * 100).round(1)
-        fig_geo = px.choropleth(
-            df_geo,
-            locations="country", locationmode="country names",
-            color="count",
-            color_continuous_scale=[[0, "#d6eaf8"], [1, "#1a5276"]],
-            custom_data=["country", "count", "pct"],
-        )
-        fig_geo.update_traces(
-            hovertemplate=(
-                "<b>%{customdata[0]}</b><br>"
-                "Trials: %{customdata[1]:,}<br>"
-                "% of total: %{customdata[2]:.1f}%"
-                "<extra></extra>"
-            ),
-            marker_line_color="white", marker_line_width=0.5,
-        )
-        fig_geo.update_layout(
-            margin=dict(t=0, b=0, l=0, r=0),
-            paper_bgcolor="white",
-            geo=dict(
-                bgcolor="white", showframe=False, showcoastlines=False,
-                showland=True, landcolor="#f0f0f0",
-                showocean=True, oceancolor="white",
-                showlakes=False,
-                showcountries=True, countrycolor="#e0e0e0", countrywidth=0.3,
-                projection_type="natural earth",
-            ),
-            coloraxis_showscale=False,
-        )
+        # Only color countries that have actual p-value data
+        df_color = df_geo[df_geo["with_pval"] > 0].copy()
+        if not df_color.empty:
+            fig_geo = px.choropleth(
+                df_color,
+                locations="country", locationmode="country names",
+                color="pct_significant",
+                color_continuous_scale=[[0, "#fef9c3"], [0.5, "#f59e0b"], [1, "#b91c1c"]],
+                range_color=[0, 100],
+                custom_data=["country", "trials", "significant", "with_pval", "pct_significant"],
+            )
+            fig_geo.update_traces(
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Trials: %{customdata[1]}<br>"
+                    "Significant outcomes: %{customdata[2]} / %{customdata[3]}<br>"
+                    "% significant: %{customdata[4]:.1f}%"
+                    "<extra></extra>"
+                ),
+                marker_line_color="white", marker_line_width=0.5,
+            )
+            fig_geo.update_layout(
+                margin=dict(t=0, b=0, l=0, r=0),
+                paper_bgcolor="white",
+                geo=dict(
+                    bgcolor="white", showframe=False, showcoastlines=False,
+                    showland=True, landcolor="#f0f0f0",
+                    showocean=True, oceancolor="white",
+                    showlakes=False,
+                    showcountries=True, countrycolor="#e0e0e0", countrywidth=0.3,
+                    projection_type="natural earth",
+                ),
+                coloraxis_colorbar=dict(
+                    title="% Significant",
+                    ticksuffix="%",
+                    thickness=12,
+                    len=0.6,
+                ),
+            )
+        else:
+            fig_geo = _empty_fig("No p-value data for geographic breakdown")
     else:
         fig_geo = _empty_fig("No geodata")
 
