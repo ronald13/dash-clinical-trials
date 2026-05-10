@@ -5,51 +5,48 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def get_boto3_session():
-    # 1. Проверяем, загрузились ли переменные из .env
+def setup_duckdb_s3(con):
+    """Configure DuckDB httpfs for S3 access.
+
+    Local dev:  reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from .env
+    EC2:        no env vars → uses IAM instance role via credential chain
+                (auto-refreshes, never expires)
+    """
     access_key = os.getenv('AWS_ACCESS_KEY_ID')
     secret_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-    region = os.getenv('AWS_REGION', 'eu-west-3')
-
-    if not access_key or not secret_key:
-        print("⚠️ ВНИМАНИЕ: AWS ключи не найдены в переменных окружения или .env файле!")
-
-    try:
-        # Пытаемся создать сессию
-        session = boto3.Session(
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name=region
-        )
-
-        # Проверяем, валидны ли учетные данные (вызов STS)
-        sts = session.client('sts')
-        identity = sts.get_caller_identity()
-        print(f"✅ Успешное подключение! ARN: {identity['Arn']}")
-        return session
-    except Exception as e:
-        print(f"❌ Ошибка аутентификации AWS: {e}")
-        return None
-
-
-def setup_duckdb_s3(con):
-    session = get_boto3_session()
-    if session is None:
-        raise Exception("Не удается настроить DuckDB: сессия AWS не создана.")
-
-    credentials = session.get_credentials()
-    if credentials is None:
-        raise Exception("Критическая ошибка: Boto3 нашел сессию, но не нашел ключи. Проверьте .env!")
-
-    creds = credentials.get_frozen_credentials()
+    region     = os.getenv('AWS_REGION', 'eu-west-3')
 
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
-    con.execute(f"SET s3_access_key_id='{creds.access_key}';")
-    con.execute(f"SET s3_secret_access_key='{creds.secret_key}';")
-    if creds.token:
-        con.execute(f"SET s3_session_token='{creds.token}';")
-    con.execute(f"SET s3_region='{session.region_name}';")
-    print("🚀 DuckDB настроен для работы с S3.")
+    con.execute(f"SET s3_region='{region}';")
+
+    if access_key and secret_key:
+        # Local dev: explicit credentials from .env
+        con.execute(f"SET s3_access_key_id='{access_key}';")
+        con.execute(f"SET s3_secret_access_key='{secret_key}';")
+        token = os.getenv('AWS_SESSION_TOKEN', '')
+        if token:
+            con.execute(f"SET s3_session_token='{token}';")
+        print(f"DuckDB S3: explicit credentials (region={region})")
+    else:
+        # EC2 / IAM role: let DuckDB use the AWS credential provider chain.
+        # This picks up the instance role automatically and refreshes tokens
+        # before they expire — no manual rotation needed.
+        con.execute("SET s3_use_credential_chain=true;")
+        print(f"DuckDB S3: IAM credential chain (region={region})")
+
+
+def get_boto3_session():
+    """Return a boto3 Session (used for any non-DuckDB AWS calls)."""
+    region = os.getenv('AWS_REGION', 'eu-west-3')
+    try:
+        session = boto3.Session(region_name=region)
+        sts = session.client('sts')
+        identity = sts.get_caller_identity()
+        print(f"AWS session OK — ARN: {identity['Arn']}")
+        return session
+    except Exception as e:
+        print(f"AWS session warning: {e}")
+        return None
 
 

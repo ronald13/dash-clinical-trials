@@ -1,0 +1,28 @@
+[Unit]
+Description=Clinical Trials Analytics Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/dash-clinical-trials
+
+# AWS region — credentials come from the EC2 IAM role automatically
+Environment=AWS_REGION=eu-west-3
+
+# 1 process, 4 threads — matches DataEngine's threading.Lock architecture.
+# Multiple workers would create separate DataEngine singletons (double S3 load on startup).
+ExecStart=/opt/dash-clinical-trials/venv/bin/gunicorn \
+    --workers 1 \
+    --threads 4 \
+    --bind 0.0.0.0:8050 \
+    --timeout 120 \
+    --keep-alive 5 \
+    --log-level info \
+    wsgi:server
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
