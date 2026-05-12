@@ -1,8 +1,10 @@
+import pandas as pd
 from dash import dcc, html, callback, Input, Output, State, dash_table, ctx
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
 from data_engine import engine
+from cache import cache
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,6 +104,36 @@ def _int_color(int_type):
     return _INT_FALLBACK[hash(int_type) % len(_INT_FALLBACK)]
 
 opts = engine.filter_options
+
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+@cache.memoize(timeout=300)
+def _fetch_interventions(phases_t, statuses_t, countries_t, study_types_t, sponsor,
+                         sem1_t, sem2_t, sem3_t, int_name, type_filter):
+    return engine.get_interventions_data(
+        phases=list(phases_t), statuses=list(statuses_t),
+        countries=list(countries_t), study_types=list(study_types_t),
+        sponsor=sponsor,
+        sem_level_1=list(sem1_t), sem_level_2=list(sem2_t), sem_level_3=list(sem3_t),
+        int_name=int_name, int_type_filter=type_filter,
+    )
+
+
+def _cache_key(phases, statuses, countries, study_types, sponsor,
+               sem1, sem2, sem3, int_name, type_filter):
+    return (
+        tuple(sorted(phases or [])),
+        tuple(sorted(statuses or [])),
+        tuple(sorted(countries or [])),
+        tuple(sorted(study_types or [])),
+        sponsor or "",
+        tuple(sorted(sem1 or [])),
+        tuple(sorted(sem2 or [])),
+        tuple(sorted(sem3 or [])),
+        int_name or "",
+        type_filter or "",
+    )
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -244,10 +276,22 @@ def render_layout():
         ], className="mb-4 g-3"),
 
         # Data Table
+        dcc.Store(id="int-table-store"),
         dbc.Card([
-            dbc.CardHeader("Full Data Table",
-                           className="bg-white fw-semibold border-0 pt-3 pb-0",
-                           style={"fontSize": "0.95rem", "color": "#333"}),
+            dbc.CardHeader(
+                html.Div([
+                    html.Span("Full Data Table", className="fw-semibold",
+                              style={"fontSize": "0.95rem", "color": "#333"}),
+                    dbc.Button(
+                        [html.I(className="bi bi-download me-1"), "CSV"],
+                        id="int-export-btn", size="sm",
+                        color="outline-secondary", className="ms-auto",
+                        style={"fontSize": "0.75rem", "padding": "2px 10px"},
+                    ),
+                    dcc.Download(id="int-download"),
+                ], className="d-flex align-items-center"),
+                className="bg-white border-0 pt-3 pb-0",
+            ),
             dbc.CardBody(dcc.Loading(
                 dash_table.DataTable(
                     id="int-table",
@@ -369,6 +413,7 @@ def update_type_badge(type_filter):
     Output("int-chart-geomap",            "figure"),
     Output("int-table",                   "data"),
     Output("int-table",                   "tooltip_data"),
+    Output("int-table-store",             "data"),
     Input("apply-filters-btn",            "n_clicks"),
     Input("int-apply-btn",                "n_clicks"),
     Input("int-type-filter",              "data"),
@@ -385,18 +430,10 @@ def update_type_badge(type_filter):
 def update_interventions(_, __, type_filter,
                          phases, statuses, countries, study_types, sponsor,
                          sem1, sem2, sem3, int_name):
-    data = engine.get_interventions_data(
-        phases=phases or [],
-        statuses=statuses or [],
-        countries=countries or [],
-        study_types=study_types or [],
-        sponsor=sponsor or "",
-        sem_level_1=sem1 or [],
-        sem_level_2=sem2 or [],
-        sem_level_3=sem3 or [],
-        int_name=int_name or "",
-        int_type_filter=type_filter,
-    )
+    data = _fetch_interventions(*_cache_key(
+        phases, statuses, countries, study_types, sponsor,
+        sem1, sem2, sem3, int_name, type_filter,
+    ))
 
     # ── Intervention Types treemap ────────────────────────────────────
     df_types = data.get("int_types")
@@ -565,8 +602,9 @@ def update_interventions(_, __, type_filter,
             {"title": {"value": row.get("title") or "", "type": "text"}}
             for row in table_records
         ]
+        store_data = table_records
     else:
-        table_records, tooltip_data = [], []
+        table_records, tooltip_data, store_data = [], [], []
 
     return (
         data["kpi_trials"],
@@ -581,4 +619,20 @@ def update_interventions(_, __, type_filter,
         fig_geo,
         table_records,
         tooltip_data,
+        store_data,
     )
+
+
+@callback(
+    Output("int-download", "data"),
+    Input("int-export-btn", "n_clicks"),
+    State("int-table-store", "data"),
+    prevent_initial_call=True,
+)
+def download_int_csv(n_clicks, store_data):
+    if not store_data:
+        return None
+    df = pd.DataFrame(store_data)
+    if "nctid" in df.columns:
+        df["nctid"] = df["nctid"].str.extract(r'\[([^\]]+)\]').fillna(df["nctid"])
+    return dcc.send_data_frame(df.to_csv, "interventions_trials.csv", index=False)

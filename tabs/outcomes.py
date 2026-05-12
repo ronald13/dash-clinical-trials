@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 from data_engine import engine
+from cache import cache
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -102,6 +103,37 @@ _TYPE_COLORS = {
 }
 
 opts = engine.filter_options
+
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+@cache.memoize(timeout=300)
+def _fetch_outcomes(phases_t, statuses_t, countries_t, study_types_t, sponsor,
+                    outcome_type_t, sponsor_class_t, primary_purpose_t, reporting_status_t):
+    return engine.get_outcomes_data(
+        phases=list(phases_t), statuses=list(statuses_t),
+        countries=list(countries_t), study_types=list(study_types_t),
+        sponsor=sponsor,
+        outcome_type=list(outcome_type_t),
+        sponsor_class=list(sponsor_class_t),
+        primary_purpose=list(primary_purpose_t),
+        reporting_status=list(reporting_status_t),
+    )
+
+
+def _cache_key(phases, statuses, countries, study_types, sponsor,
+               outcome_type, sponsor_class, primary_purpose, reporting_status):
+    return (
+        tuple(sorted(phases or [])),
+        tuple(sorted(statuses or [])),
+        tuple(sorted(countries or [])),
+        tuple(sorted(study_types or [])),
+        sponsor or "",
+        tuple(sorted(outcome_type or [])),
+        tuple(sorted(sponsor_class or [])),
+        tuple(sorted(primary_purpose or [])),
+        tuple(sorted(reporting_status or [])),
+    )
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -243,10 +275,22 @@ def render_layout():
         ], className="mb-4 g-3"),
 
         # Data Table
+        dcc.Store(id="out-table-store"),
         dbc.Card([
-            dbc.CardHeader("Outcome Details",
-                           className="bg-white fw-semibold border-0 pt-3 pb-0",
-                           style={"fontSize": "0.95rem", "color": "#333"}),
+            dbc.CardHeader(
+                html.Div([
+                    html.Span("Outcome Details", className="fw-semibold",
+                              style={"fontSize": "0.95rem", "color": "#333"}),
+                    dbc.Button(
+                        [html.I(className="bi bi-download me-1"), "CSV"],
+                        id="out-export-btn", size="sm",
+                        color="outline-secondary", className="ms-auto",
+                        style={"fontSize": "0.75rem", "padding": "2px 10px"},
+                    ),
+                    dcc.Download(id="out-download"),
+                ], className="d-flex align-items-center"),
+                className="bg-white border-0 pt-3 pb-0",
+            ),
             dbc.CardBody(dcc.Loading(
                 dash_table.DataTable(
                     id="out-table",
@@ -331,6 +375,7 @@ def render_layout():
     Output("out-chart-param",         "figure"),
     Output("out-chart-geo",           "figure"),
     Output("out-table",               "data"),
+    Output("out-table-store",         "data"),
     Input("apply-filters-btn",             "n_clicks"),
     Input("out-apply-btn",                 "n_clicks"),
     State("phase-dropdown",                "value"),
@@ -346,17 +391,10 @@ def render_layout():
 def update_outcomes(_, __,
                     phases, statuses, countries, study_types, sponsor,
                     outcome_type, sponsor_class, primary_purpose, reporting_status):
-    data = engine.get_outcomes_data(
-        phases=phases or [],
-        statuses=statuses or [],
-        countries=countries or [],
-        study_types=study_types or [],
-        sponsor=sponsor or "",
-        outcome_type=outcome_type,
-        sponsor_class=sponsor_class,
-        primary_purpose=primary_purpose,
-        reporting_status=reporting_status,
-    )
+    data = _fetch_outcomes(*_cache_key(
+        phases, statuses, countries, study_types, sponsor,
+        outcome_type, sponsor_class, primary_purpose, reporting_status,
+    ))
 
     # ── KPI values ────────────────────────────────────────────────────────
     kpi_trials_sub  = "unique trials"
@@ -558,10 +596,11 @@ def update_outcomes(_, __,
 
     # ── Table ─────────────────────────────────────────────────────────────
     df_table = data.get("table_data")
-    table_records = (
-        df_table.to_dict("records")
-        if df_table is not None and not df_table.empty else []
-    )
+    if df_table is not None and not df_table.empty:
+        table_records = df_table.to_dict("records")
+        store_data = table_records
+    else:
+        table_records, store_data = [], []
 
     return (
         data["kpi_trials"],     kpi_trials_sub,
@@ -576,4 +615,20 @@ def update_outcomes(_, __,
         fig_param,
         fig_geo,
         table_records,
+        store_data,
     )
+
+
+@callback(
+    Output("out-download", "data"),
+    Input("out-export-btn", "n_clicks"),
+    State("out-table-store", "data"),
+    prevent_initial_call=True,
+)
+def download_out_csv(n_clicks, store_data):
+    if not store_data:
+        return None
+    df = pd.DataFrame(store_data)
+    if "nctid" in df.columns:
+        df["nctid"] = df["nctid"].str.extract(r'\[([^\]]+)\]').fillna(df["nctid"])
+    return dcc.send_data_frame(df.to_csv, "outcomes_trials.csv", index=False)

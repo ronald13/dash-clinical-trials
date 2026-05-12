@@ -4,6 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 from data_engine import engine
+from cache import cache
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,6 +110,34 @@ def _cond_color(cat):
 
 
 opts = engine.filter_options
+
+
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+@cache.memoize(timeout=300)
+def _fetch_conditions(phases_t, statuses_t, countries_t, study_types_t, sponsor,
+                      int_type_t, cond_name, level1_filter):
+    return engine.get_conditions_data(
+        phases=list(phases_t), statuses=list(statuses_t),
+        countries=list(countries_t), study_types=list(study_types_t),
+        sponsor=sponsor,
+        int_type=list(int_type_t),
+        cond_name=cond_name, level1_filter=level1_filter,
+    )
+
+
+def _cache_key(phases, statuses, countries, study_types, sponsor,
+               int_type, cond_name, level1_filter):
+    return (
+        tuple(sorted(phases or [])),
+        tuple(sorted(statuses or [])),
+        tuple(sorted(countries or [])),
+        tuple(sorted(study_types or [])),
+        sponsor or "",
+        tuple(sorted(int_type or [])),
+        cond_name or "",
+        level1_filter or "",
+    )
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
@@ -237,10 +266,22 @@ def render_layout():
         ], className="mb-4 g-3"),
 
         # Data Table
+        dcc.Store(id="cond-table-store"),
         dbc.Card([
-            dbc.CardHeader("Detailed Trial Records",
-                           className="bg-white fw-semibold border-0 pt-3 pb-0",
-                           style={"fontSize": "0.95rem", "color": "#333"}),
+            dbc.CardHeader(
+                html.Div([
+                    html.Span("Detailed Trial Records", className="fw-semibold",
+                              style={"fontSize": "0.95rem", "color": "#333"}),
+                    dbc.Button(
+                        [html.I(className="bi bi-download me-1"), "CSV"],
+                        id="cond-export-btn", size="sm",
+                        color="outline-secondary", className="ms-auto",
+                        style={"fontSize": "0.75rem", "padding": "2px 10px"},
+                    ),
+                    dcc.Download(id="cond-download"),
+                ], className="d-flex align-items-center"),
+                className="bg-white border-0 pt-3 pb-0",
+            ),
             dbc.CardBody(dcc.Loading(
                 dash_table.DataTable(
                     id="cond-table",
@@ -347,6 +388,7 @@ def update_level1_badge(level1_filter):
     Output("cond-chart-trend",      "figure"),
     Output("cond-chart-geo",        "figure"),
     Output("cond-table",            "data"),
+    Output("cond-table-store",      "data"),
     Input("apply-filters-btn",      "n_clicks"),
     Input("cond-apply-btn",         "n_clicks"),
     Input("cond-level1-filter",     "data"),
@@ -361,16 +403,10 @@ def update_level1_badge(level1_filter):
 def update_conditions(_, __, level1_filter,
                       phases, statuses, countries, study_types, sponsor,
                       int_type, cond_name):
-    data = engine.get_conditions_data(
-        phases=phases or [],
-        statuses=statuses or [],
-        countries=countries or [],
-        study_types=study_types or [],
-        sponsor=sponsor or "",
-        int_type=int_type or None,
-        cond_name=cond_name or "",
-        level1_filter=level1_filter,
-    )
+    data = _fetch_conditions(*_cache_key(
+        phases, statuses, countries, study_types, sponsor,
+        int_type, cond_name, level1_filter,
+    ))
 
     # ── Conditions treemap ────────────────────────────────────────────────
     df_tree = data.get("cond_tree")
@@ -529,7 +565,11 @@ def update_conditions(_, __, level1_filter,
 
     # ── Table ─────────────────────────────────────────────────────────────
     df_table = data.get("table_data")
-    table_records = df_table.to_dict("records") if df_table is not None and not df_table.empty else []
+    if df_table is not None and not df_table.empty:
+        table_records = df_table.to_dict("records")
+        store_data = table_records
+    else:
+        table_records, store_data = [], []
 
     return (
         data["kpi_trials"],
@@ -543,4 +583,20 @@ def update_conditions(_, __, level1_filter,
         fig_trend,
         fig_geo,
         table_records,
+        store_data,
     )
+
+
+@callback(
+    Output("cond-download", "data"),
+    Input("cond-export-btn", "n_clicks"),
+    State("cond-table-store", "data"),
+    prevent_initial_call=True,
+)
+def download_cond_csv(n_clicks, store_data):
+    if not store_data:
+        return None
+    df = pd.DataFrame(store_data)
+    if "nctid" in df.columns:
+        df["nctid"] = df["nctid"].str.extract(r'\[([^\]]+)\]').fillna(df["nctid"])
+    return dcc.send_data_frame(df.to_csv, "conditions_trials.csv", index=False)

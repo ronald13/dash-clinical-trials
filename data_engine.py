@@ -16,6 +16,7 @@ class DataEngine:
         setup_duckdb_s3(self.con)
         self._initialize_views()
         self.filter_options = self._load_filter_options()
+        self._s3_signatures = self._get_s3_signatures()
 
     # ------------------------------------------------------------------
     # Init helpers
@@ -109,6 +110,46 @@ class DataEngine:
         except Exception:
             pass
         return result
+
+    # ------------------------------------------------------------------
+    # S3 change detection
+    # ------------------------------------------------------------------
+
+    def _get_s3_signatures(self):
+        """Return {table_name: max_last_modified_str} for key S3 prefixes."""
+        import boto3
+        import os as _os
+        region = _os.getenv('AWS_REGION', 'eu-west-3')
+        signatures = {}
+        check = {k: v for k, v in TABLES.items() if k in ('base', 'interventions')}
+        try:
+            s3 = boto3.client('s3', region_name=region)
+            for name, s3_path in check.items():
+                path_no_proto = s3_path.replace('s3://', '')
+                bucket, _, rest = path_no_proto.partition('/')
+                prefix = rest.rsplit('/', 1)[0] + '/'
+                resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=200)
+                contents = resp.get('Contents', [])
+                if contents:
+                    signatures[name] = str(max(o['LastModified'] for o in contents))
+        except Exception as e:
+            print(f"S3 signature check error: {e}")
+        return signatures
+
+    def reload_if_changed(self):
+        """Check S3 for updated files; reload filter_options if changed. Returns True if reloaded."""
+        try:
+            new_sigs = self._get_s3_signatures()
+            if not new_sigs or new_sigs == self._s3_signatures:
+                return False
+            self._s3_signatures = new_sigs
+            with self._lock:
+                self.filter_options = self._load_filter_options()
+            print("DataEngine: S3 data updated — filter options reloaded")
+            return True
+        except Exception as e:
+            print(f"DataEngine.reload_if_changed error: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Query builder
@@ -415,6 +456,41 @@ class DataEngine:
             print(f"Duration query error: {e}")
             df_duration = None
 
+        # ── Gantt — top 40 trials by enrollment with valid start/completion ────
+        try:
+            df_gantt = self.con.execute(f"""
+                {base_cte},
+                agg_ph_gantt AS (
+                    SELECT protocolsection_identificationmodule_nctid AS nctid,
+                           MIN(protocolsection_designmodule_phases) AS phase
+                    FROM phases GROUP BY 1
+                )
+                SELECT
+                    b.protocolsection_identificationmodule_nctid AS nctid,
+                    SUBSTR(b.protocolsection_identificationmodule_brieftitle, 1, 55) AS title,
+                    COALESCE(ap.phase, 'N/A') AS phase,
+                    b.protocolsection_statusmodule_overallstatus AS status,
+                    CAST(TRY_CAST(b.protocolsection_statusmodule_startdatestruct_date
+                                  AS DATE) AS VARCHAR) AS start_date,
+                    CAST(TRY_CAST(b.protocolsection_statusmodule_completiondatestruct_date
+                                  AS DATE) AS VARCHAR) AS end_date,
+                    CAST(b.protocolsection_designmodule_enrollmentinfo_count AS BIGINT) AS enrollment
+                FROM base b
+                JOIN filtered_trials ft
+                  ON b.protocolsection_identificationmodule_nctid = ft.nctid
+                LEFT JOIN agg_ph_gantt ap
+                  ON b.protocolsection_identificationmodule_nctid = ap.nctid
+                WHERE TRY_CAST(b.protocolsection_statusmodule_startdatestruct_date AS DATE) IS NOT NULL
+                  AND TRY_CAST(b.protocolsection_statusmodule_completiondatestruct_date AS DATE) IS NOT NULL
+                  AND TRY_CAST(b.protocolsection_statusmodule_completiondatestruct_date AS DATE) >
+                      TRY_CAST(b.protocolsection_statusmodule_startdatestruct_date AS DATE)
+                ORDER BY enrollment DESC NULLS LAST, nctid
+                LIMIT 40
+            """).df()
+        except Exception as e:
+            print(f"Gantt query error: {e}")
+            df_gantt = None
+
         prev_year = datetime.now().year - 1
         new_label = f"+ {new_last_year:,} new in {prev_year}"
 
@@ -433,6 +509,7 @@ class DataEngine:
             "sponsor_dist":    df_sponsors,
             "table_data":      df_table,
             "duration_dist":   df_duration,
+            "gantt_data":      df_gantt,
         }
 
 

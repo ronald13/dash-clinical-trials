@@ -1,14 +1,15 @@
+import pandas as pd
 from dash import dcc, html, callback, Input, Output, State, dash_table
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
 from data_engine import engine
+from cache import cache
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _fmt_label(v):
-    """Smart number label: avoids '0.00K' for small values."""
     if v is None:
         return ""
     if v >= 1_000_000:
@@ -76,9 +77,31 @@ def _kpi_card(title, value_id, icon_cls, gradient,
               "boxShadow": "0 2px 10px rgba(0,0,0,0.07)"})
 
 
+# ── Caching ───────────────────────────────────────────────────────────────────
+
+@cache.memoize(timeout=300)
+def _fetch_overview(phases_t, statuses_t, countries_t, study_types_t, sponsor):
+    return engine.get_overview_data(
+        phases=list(phases_t),
+        statuses=list(statuses_t),
+        countries=list(countries_t),
+        study_types=list(study_types_t),
+        sponsor=sponsor,
+    )
+
+
+def _cache_key(phases, statuses, countries, study_types, sponsor):
+    return (
+        tuple(sorted(phases or [])),
+        tuple(sorted(statuses or [])),
+        tuple(sorted(countries or [])),
+        tuple(sorted(study_types or [])),
+        sponsor or "",
+    )
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
 
-# Phase display order for duration chart
 _PHASE_ORDER = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "NA", "N/A"]
 _PHASE_COLORS = {
     "PHASE1": "#4e79a7", "PHASE2": "#f28e2b",
@@ -134,11 +157,22 @@ def render_layout():
             dbc.Col(_chart_card("Status Distribution", "chart-status-bar",  290), width=4),
         ], className="mb-4 g-3"),
 
-        # Table
+        # Table with export button
         dbc.Card([
-            dbc.CardHeader("Table View",
-                           className="bg-white fw-semibold border-0 pt-3 pb-0",
-                           style={"fontSize": "0.95rem", "color": "#333"}),
+            dbc.CardHeader(
+                html.Div([
+                    html.Span("Table View", className="fw-semibold",
+                              style={"fontSize": "0.95rem", "color": "#333"}),
+                    dbc.Button(
+                        [html.I(className="bi bi-download me-1"), "CSV"],
+                        id="overview-export-btn", size="sm",
+                        color="outline-secondary", className="ms-auto",
+                        style={"fontSize": "0.75rem", "padding": "2px 10px"},
+                    ),
+                    dcc.Download(id="overview-download"),
+                ], className="d-flex align-items-center"),
+                className="bg-white border-0 pt-3 pb-0",
+            ),
             dbc.CardBody(dcc.Loading(
                 dash_table.DataTable(
                     id="trials-table",
@@ -204,6 +238,9 @@ def render_layout():
            style={"borderRadius": "12px", "border": "none",
                   "boxShadow": "0 2px 10px rgba(0,0,0,0.07)"}),
 
+        # Hidden store for CSV export
+        dcc.Store(id="overview-table-store"),
+
         # GeoMap + Sponsors
         dbc.Row([
             dbc.Col(_chart_card("GeoMap",          "chart-geomap",   380), width=6),
@@ -217,42 +254,45 @@ def render_layout():
                 "chart-duration-bar", 320), width=12),
         ], className="mb-4 g-3"),
 
+        # Trial Timeline (Gantt)
+        dbc.Row([
+            dbc.Col(_chart_card(
+                "Trial Timeline — Top 40 trials by enrollment",
+                "chart-gantt", 680), width=12),
+        ], className="mb-4 g-3"),
+
     ], style={"padding": "6px 8px"})
 
 
-# ── Callback ──────────────────────────────────────────────────────────────────
+# ── Callbacks ─────────────────────────────────────────────────────────────────
 
 @callback(
-    Output("kpi-trials",         "children"),
-    Output("kpi-trials-new",     "children"),
-    Output("kpi-enrollment",     "children"),
-    Output("kpi-results",        "children"),
-    Output("kpi-results-sub",    "children"),
-    Output("kpi-completion",     "children"),
-    Output("last-update-date",   "children"),
-    Output("chart-delay-donut",  "figure"),
-    Output("chart-sex-donut",    "figure"),
-    Output("chart-status-bar",   "figure"),
-    Output("trials-table",       "data"),
-    Output("trials-table",       "tooltip_data"),
-    Output("chart-geomap",       "figure"),
-    Output("chart-sponsors",     "figure"),
-    Output("chart-duration-bar", "figure"),
-    Input("apply-filters-btn",   "n_clicks"),
-    State("phase-dropdown",      "value"),
-    State("status-dropdown",     "value"),
-    State("country-dropdown",    "value"),
-    State("study-type-dropdown", "value"),
-    State("sponsor-input",       "value"),
+    Output("kpi-trials",            "children"),
+    Output("kpi-trials-new",        "children"),
+    Output("kpi-enrollment",        "children"),
+    Output("kpi-results",           "children"),
+    Output("kpi-results-sub",       "children"),
+    Output("kpi-completion",        "children"),
+    Output("last-update-date",      "children"),
+    Output("chart-delay-donut",     "figure"),
+    Output("chart-sex-donut",       "figure"),
+    Output("chart-status-bar",      "figure"),
+    Output("trials-table",          "data"),
+    Output("trials-table",          "tooltip_data"),
+    Output("overview-table-store",  "data"),
+    Output("chart-geomap",          "figure"),
+    Output("chart-sponsors",        "figure"),
+    Output("chart-duration-bar",    "figure"),
+    Output("chart-gantt",           "figure"),
+    Input("apply-filters-btn",      "n_clicks"),
+    State("phase-dropdown",         "value"),
+    State("status-dropdown",        "value"),
+    State("country-dropdown",       "value"),
+    State("study-type-dropdown",    "value"),
+    State("sponsor-input",          "value"),
 )
 def update_overview(_, phases, statuses, countries, study_types, sponsor):
-    data = engine.get_overview_data(
-        phases=phases or [],
-        statuses=statuses or [],
-        countries=countries or [],
-        study_types=study_types or [],
-        sponsor=sponsor or "",
-    )
+    data = _fetch_overview(*_cache_key(phases, statuses, countries, study_types, sponsor))
 
     # ── Delay Status donut ────────────────────────────────────────────
     df_delay = data["delay_dist"]
@@ -271,7 +311,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
-                    )
+        )
     else:
         fig_delay = _empty_fig()
 
@@ -292,7 +332,7 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=10, b=30, l=10, r=10),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center", font=dict(size=11)),
-                    )
+        )
     else:
         fig_sex = _empty_fig()
 
@@ -329,8 +369,9 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             {"title": {"value": row.get("title") or "", "type": "text"}}
             for row in table_records
         ]
+        store_data = table_records
     else:
-        table_records, tooltip_data = [], []
+        table_records, tooltip_data, store_data = [], [], []
 
     # ── GeoMap — minimalist ───────────────────────────────────────────
     df_geo = data.get("geo_dist")
@@ -357,19 +398,18 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             margin=dict(t=0, b=0, l=0, r=0),
             paper_bgcolor="white",
             geo=dict(
-            bgcolor="white",
-            showframe=False,
-            showcoastlines=False,
-            showland=True, landcolor="#f0f0f0",
-            showocean=True, oceancolor="white",
-            showlakes=False,
-            showcountries=True,        # ← вместо showborders
-            countrycolor="#e0e0e0",    # ← вместо bordercolor
-            # borderwidth не нужен — толщина линий страновых границ не настраивается
-            projection_type="natural earth",
-        ),
+                bgcolor="white",
+                showframe=False,
+                showcoastlines=False,
+                showland=True, landcolor="#f0f0f0",
+                showocean=True, oceancolor="white",
+                showlakes=False,
+                showcountries=True,
+                countrycolor="#e0e0e0",
+                projection_type="natural earth",
+            ),
             coloraxis_showscale=False,
-                    )
+        )
     else:
         fig_geo = _empty_fig("No geodata")
 
@@ -402,7 +442,6 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
     df_dur = data.get("duration_dist")
     if df_dur is not None and not df_dur.empty:
         df_dur = df_dur.copy()
-        # Remove unknown/unspecified phases
         df_dur = df_dur[~df_dur["phase"].isin(["N/A", "NA"])]
 
     if df_dur is not None and not df_dur.empty:
@@ -433,9 +472,47 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
             xaxis={"title": "Median duration (months)", "tickfont": {"size": 11}},
             margin=dict(t=10, b=30, l=10, r=65),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            showlegend=False, bargap=0.4,         )
+            showlegend=False, bargap=0.4,
+        )
     else:
         fig_dur = _empty_fig("No duration data (dates missing or not completed)")
+
+    # ── Gantt ─────────────────────────────────────────────────────────
+    df_gantt = data.get("gantt_data")
+    if df_gantt is not None and not df_gantt.empty:
+        df_gantt = df_gantt.copy()
+        df_gantt["label"] = df_gantt.apply(
+            lambda r: f"{r['nctid']}  {r['title']}", axis=1
+        )
+        fig_gantt = px.timeline(
+            df_gantt,
+            x_start="start_date", x_end="end_date",
+            y="label", color="phase",
+            color_discrete_map={**_PHASE_COLORS, "N/A": "#bab0ac"},
+            custom_data=["nctid", "phase", "status", "enrollment"],
+        )
+        fig_gantt.update_traces(
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "Phase: %{customdata[1]}<br>"
+                "Status: %{customdata[2]}<br>"
+                "Enrollment: %{customdata[3]:,}<br>"
+                "Start → End: %{base|%b %Y} → %{x|%b %Y}"
+                "<extra></extra>"
+            ),
+        )
+        fig_gantt.update_layout(
+            yaxis={"title": "", "tickfont": {"size": 10},
+                   "autorange": "reversed", "ticklabelstandoff": 8},
+            xaxis={"title": "", "tickfont": {"size": 11}},
+            margin=dict(t=10, b=10, l=10, r=10),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(title="Phase", orientation="h",
+                        y=-0.04, x=0.5, xanchor="center"),
+            bargap=0.25,
+        )
+    else:
+        fig_gantt = _empty_fig("No timeline data (requires valid start/completion dates)")
 
     return (
         data["kpi_trials"],
@@ -450,7 +527,25 @@ def update_overview(_, phases, statuses, countries, study_types, sponsor):
         fig_status,
         table_records,
         tooltip_data,
+        store_data,
         fig_geo,
         fig_sponsors,
         fig_dur,
+        fig_gantt,
     )
+
+
+@callback(
+    Output("overview-download", "data"),
+    Input("overview-export-btn", "n_clicks"),
+    State("overview-table-store", "data"),
+    prevent_initial_call=True,
+)
+def download_overview_csv(n_clicks, store_data):
+    if not store_data:
+        return None
+    df = pd.DataFrame(store_data)
+    # Strip markdown links from nctid: [NCT123](url) → NCT123
+    if "nctid" in df.columns:
+        df["nctid"] = df["nctid"].str.extract(r'\[([^\]]+)\]').fillna(df["nctid"])
+    return dcc.send_data_frame(df.to_csv, "overview_trials.csv", index=False)
