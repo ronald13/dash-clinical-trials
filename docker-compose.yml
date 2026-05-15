@@ -1,0 +1,14 @@
+services:
+  clinical-trials:
+    build: .
+    image: clinical-trials:latest
+    container_name: clinical-trials
+    ports:
+      - "8050:8050"
+    environment:
+      - AWS_REGION=${AWS_REGION:-eu-west-3}
+      # Local dev: set these in .env — on EC2 leave empty, IAM role is used automatically
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+    restart: unless-stopped
