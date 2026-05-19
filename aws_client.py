@@ -32,7 +32,12 @@ def setup_duckdb_s3(con):
         # EC2 / IAM role: let DuckDB use the AWS credential provider chain.
         # This picks up the instance role automatically and refreshes tokens
         # before they expire — no manual rotation needed.
-        con.execute("SET s3_use_credential_chain=true;")
+        # con.execute("SET s3_use_credential_chain=true;")
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
+        con.execute("INSTALL aws;")
+        con.execute("LOAD aws;")
+        con.execute("CALL load_aws_credentials();")
         print(f"DuckDB S3: IAM credential chain (region={region})")
 
 
