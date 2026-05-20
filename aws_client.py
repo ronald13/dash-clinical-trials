@@ -37,7 +37,7 @@ def setup_duckdb_s3(con):
         con.execute("LOAD httpfs;")
         con.execute("INSTALL aws;")
         con.execute("LOAD aws;")
-        con.execute("CALL load_aws_credentials();")
+        con.execute("CREATE SECRET (TYPE S3, PROVIDER CREDENTIAL_CHAIN);")
         print(f"DuckDB S3: IAM credential chain (region={region})")
 
 
